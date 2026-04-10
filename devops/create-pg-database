@@ -102,6 +102,11 @@ Usage: $0 [options]
 Interactive PostgreSQL database & user provisioner.
 Run without flags for a guided wizard, or pass flags for scripted use.
 
+Commands:
+  (default)                Interactive wizard — create database + user
+  --list-users             List all PostgreSQL roles with details
+  --change-password        Change password for an existing user
+
 Options:
   --db-name NAME           Database name
   --user NAME              Database user
@@ -114,6 +119,9 @@ Options:
 
 Examples:
   $0                                              # interactive wizard
+  $0 --list-users                                 # show all roles
+  $0 --change-password                            # interactive password change
+  $0 --change-password --user myuser              # change password for specific user
   $0 --db-name myapp --user myuser --orm prisma   # partial flags, prompts for rest
   $0 --db-name myapp --user myuser --password secret --orm prisma --non-interactive
 EOF
@@ -173,6 +181,153 @@ pg_listen_addresses() {
 
 pg_port() {
   sudo -u postgres psql -tAc "SHOW port;" 2>/dev/null | xargs
+}
+
+pg_list_roles_detailed() {
+  sudo -u postgres psql -c "
+    SELECT
+      r.rolname                              AS \"Role\",
+      CASE WHEN r.rolcanlogin  THEN 'yes' ELSE 'no' END AS \"Login\",
+      CASE WHEN r.rolsuper     THEN 'yes' ELSE 'no' END AS \"Superuser\",
+      CASE WHEN r.rolcreatedb  THEN 'yes' ELSE 'no' END AS \"Create DB\",
+      CASE WHEN r.rolcreaterole THEN 'yes' ELSE 'no' END AS \"Create Role\",
+      COALESCE(
+        (SELECT string_agg(d.datname, ', ' ORDER BY d.datname)
+         FROM pg_database d
+         WHERE d.datdba = r.oid AND NOT d.datistemplate), ''
+      )                                      AS \"Owns databases\",
+      r.rolconnlimit                         AS \"Conn limit\"
+    FROM pg_roles r
+    WHERE r.rolname NOT LIKE 'pg_%'
+    ORDER BY r.rolname;
+  " 2>/dev/null
+}
+
+# ---------------------------
+# Command: list users
+# ---------------------------
+cmd_list_users() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}PostgreSQL Roles${RESET}                            ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  if ! pg_is_installed; then
+    error "PostgreSQL client (psql) is not installed."
+    exit 1
+  fi
+  if ! pg_is_running; then
+    error "PostgreSQL server is not running."
+    exit 1
+  fi
+
+  echo
+  pg_list_roles_detailed
+
+  # Show which roles connect to which databases
+  echo
+  echo -e "${BOLD}Database access (granted CONNECT):${RESET}"
+  echo
+  sudo -u postgres psql -c "
+    SELECT
+      d.datname   AS \"Database\",
+      r.rolname   AS \"Role\",
+      CASE
+        WHEN d.datdba = r.oid THEN 'owner'
+        WHEN has_database_privilege(r.oid, d.oid, 'CONNECT') THEN 'connect'
+        ELSE 'none'
+      END AS \"Access\"
+    FROM pg_database d
+    CROSS JOIN pg_roles r
+    WHERE NOT d.datistemplate
+      AND r.rolname NOT LIKE 'pg_%'
+      AND r.rolcanlogin
+      AND (d.datdba = r.oid OR has_database_privilege(r.oid, d.oid, 'CONNECT'))
+    ORDER BY d.datname, r.rolname;
+  " 2>/dev/null
+
+  echo
+  exit 0
+}
+
+# ---------------------------
+# Command: change password
+# ---------------------------
+cmd_change_password() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Change PostgreSQL Password${RESET}                  ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  if ! pg_is_installed; then
+    error "PostgreSQL client (psql) is not installed."
+    exit 1
+  fi
+  if ! pg_is_running; then
+    error "PostgreSQL server is not running."
+    exit 1
+  fi
+
+  # Show existing roles
+  echo
+  echo -e "  ${UNDERLINE}Existing roles:${RESET}"
+  local roles
+  roles=$(pg_list_roles)
+  if [[ -z "$roles" ]]; then
+    error "No roles found."
+    exit 1
+  fi
+  while IFS= read -r role; do
+    echo -e "    ${DIM}•${RESET} ${role}"
+  done <<< "$roles"
+  echo
+
+  # Pick user
+  local target_user="$DB_USER"
+  if [[ -z "$target_user" ]]; then
+    ask "Which user to change password for" target_user
+  else
+    info "User: ${WHITE}${target_user}${RESET} (from flag)"
+  fi
+
+  if ! pg_role_exists "$target_user"; then
+    error "Role '${target_user}' does not exist."
+    exit 1
+  fi
+
+  # Get new password
+  local new_pass="" confirm_pass=""
+  ask_secret "New password for '${target_user}'" new_pass
+  while [[ -z "$new_pass" ]]; do
+    error "Password cannot be empty."
+    ask_secret "New password for '${target_user}'" new_pass
+  done
+
+  ask_secret "Confirm password" confirm_pass
+  if [[ "$new_pass" != "$confirm_pass" ]]; then
+    error "Passwords do not match."
+    exit 1
+  fi
+
+  # Confirm
+  echo
+  echo -e "  ${BOLD}Will change password for:${RESET} ${WHITE}${target_user}${RESET}"
+  confirm_or_abort
+
+  # Execute
+  echo -en "  Changing password for '${target_user}' ... "
+  sudo -u postgres psql -q -c "ALTER ROLE \"${target_user}\" PASSWORD '${new_pass}';"
+  echo -e "${GREEN}done${RESET}"
+
+  echo
+  success "Password changed for '${target_user}'."
+
+  local port
+  port=$(pg_port 2>/dev/null || echo "5432")
+  echo -e "  ${DIM}Test with:${RESET} ${CYAN}psql -h localhost -p ${port} -U ${target_user} -d postgres${RESET}"
+  echo
+
+  exit 0
 }
 
 # ---------------------------
@@ -575,12 +730,18 @@ USE_EXISTING_USER="n"
 NON_INTERACTIVE="n"
 DB_ALREADY_EXISTS="n"
 ROLE_ALREADY_EXISTS="n"
+CMD_LIST_USERS="n"
+CMD_CHANGE_PASS="n"
 
 # ---------------------------
 # Parse flags
 # ---------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --list-users)
+      CMD_LIST_USERS="y"; shift ;;
+    --change-password)
+      CMD_CHANGE_PASS="y"; shift ;;
     --db-name)
       DB_NAME="$2"; shift 2 ;;
     --user)
@@ -603,6 +764,12 @@ while [[ $# -gt 0 ]]; do
       show_help ;;
   esac
 done
+
+# ---------------------------
+# Dispatch commands
+# ---------------------------
+[[ "$CMD_LIST_USERS" == "y" ]] && cmd_list_users
+[[ "$CMD_CHANGE_PASS" == "y" ]] && cmd_change_password
 
 # ---------------------------
 # Non-interactive validation

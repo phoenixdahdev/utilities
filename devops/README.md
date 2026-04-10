@@ -61,6 +61,9 @@ Interactive PostgreSQL database and user provisioner.
 
 ```bash
 ./create-pg-database                                              # interactive wizard
+./create-pg-database --list-users                                 # show all roles + access
+./create-pg-database --change-password                            # change a user's password
+./create-pg-database --change-password --user myuser              # change specific user's password
 ./create-pg-database --db-name myapp --user myuser --orm prisma   # partial flags
 ./create-pg-database --db-name myapp --user myuser --password secret --orm prisma --non-interactive
 ```
@@ -71,6 +74,8 @@ Interactive PostgreSQL database and user provisioner.
 - ORM-aware permissions: `prisma`, `typeorm`, `sequelize`, `django`, `generic`
 - `--owner` mode for full database ownership
 - `--existing-user` to skip role creation
+- `--list-users` shows all roles with login/superuser/createdb flags, owned databases, and database access map
+- `--change-password` interactive password change with confirmation
 - Prints ready-to-paste connection strings (Prisma `.env`, Django `settings.py`, TypeORM, Sequelize)
 
 ---
