@@ -60,22 +60,50 @@ Provisions a production server (Ubuntu/Debian). Run as root or a sudo user.
 Interactive PostgreSQL database and user provisioner.
 
 ```bash
+# Create database + user
 ./create-pg-database                                              # interactive wizard
-./create-pg-database --list-users                                 # show all roles + access
-./create-pg-database --change-password                            # change a user's password
-./create-pg-database --change-password --user myuser              # change specific user's password
 ./create-pg-database --db-name myapp --user myuser --orm prisma   # partial flags
 ./create-pg-database --db-name myapp --user myuser --password secret --orm prisma --non-interactive
+
+# Inspect
+./create-pg-database --list-users                                 # all roles + access map
+./create-pg-database --list-databases                             # all databases + sizes + table counts
+./create-pg-database --db-info --db-name myapp                    # tables, indexes, extensions, roles
+./create-pg-database --connection-test --db-name myapp --user mu  # test connectivity + privileges
+
+# Manage users
+./create-pg-database --change-password                            # change a user's password
+./create-pg-database --change-password --user myuser              # change specific user
+./create-pg-database --drop-user --user olduser                   # drop a role
+
+# Manage databases
+./create-pg-database --drop-database --db-name oldapp             # drop a database (double confirm)
+
+# Backup & restore
+./create-pg-database --backup --db-name myapp                     # backup to ./myapp_<date>.dump
+./create-pg-database --backup --db-name myapp --file /tmp/bk.dump --format plain
+./create-pg-database --restore --db-name myapp --file bk.dump     # restore from backup
 ```
 
+**Commands:**
+
+| Command | What it does |
+|---|---|
+| *(default)* | Interactive wizard — create database + user with ORM-aware grants |
+| `--list-users` | All roles with login/superuser/createdb flags, owned databases, access map |
+| `--list-databases` | All databases with size, owner, table counts |
+| `--db-info` | Deep inspect: tables with sizes + row estimates, indexes, extensions, connected roles |
+| `--connection-test` | Verify user can connect — checks server, auth, SELECT, schema access, TEMP tables |
+| `--change-password` | Interactive password change with confirmation |
+| `--drop-database` | Drop database with size/table warning + double confirmation (type name to confirm) |
+| `--drop-user` | Drop role, auto-reassigns owned objects, prevents dropping `postgres` |
+| `--backup` | `pg_dump` wrapper — custom/plain/directory formats, auto-named output files |
+| `--restore` | `pg_restore`/`psql` wrapper — auto-detects format, creates database if missing |
+
 **Features:**
-- Detects PostgreSQL version, port, connections, existing databases and roles
-- Creates role + database + grants in one flow
 - ORM-aware permissions: `prisma`, `typeorm`, `sequelize`, `django`, `generic`
 - `--owner` mode for full database ownership
 - `--existing-user` to skip role creation
-- `--list-users` shows all roles with login/superuser/createdb flags, owned databases, and database access map
-- `--change-password` interactive password change with confirmation
 - Prints ready-to-paste connection strings (Prisma `.env`, Django `settings.py`, TypeORM, Sequelize)
 
 ---

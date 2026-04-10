@@ -105,7 +105,14 @@ Run without flags for a guided wizard, or pass flags for scripted use.
 Commands:
   (default)                Interactive wizard — create database + user
   --list-users             List all PostgreSQL roles with details
+  --list-databases         List all databases with size, owner, tables
   --change-password        Change password for an existing user
+  --drop-database          Drop a database (interactive confirmation)
+  --drop-user              Drop a role (interactive confirmation)
+  --backup                 Backup a database (pg_dump)
+  --restore                Restore a database from backup
+  --connection-test        Test if a user can connect to a database
+  --db-info                Show tables, size, and stats for a database
 
 Options:
   --db-name NAME           Database name
@@ -114,16 +121,25 @@ Options:
   --orm ORM                prisma | typeorm | sequelize | django | generic
   --owner                  Make user database owner (skip ORM grants)
   --existing-user          Use an existing PostgreSQL role
+  --file FILE              Backup/restore file path
+  --format FORMAT          Backup format: custom (default), plain, directory
   --non-interactive        Skip wizard, require all values via flags
   --help                   Show this help message
 
 Examples:
   $0                                              # interactive wizard
   $0 --list-users                                 # show all roles
+  $0 --list-databases                             # show all databases
   $0 --change-password                            # interactive password change
-  $0 --change-password --user myuser              # change password for specific user
+  $0 --change-password --user myuser              # change specific user
+  $0 --drop-database --db-name oldapp             # drop a database
+  $0 --drop-user --user olduser                   # drop a role
+  $0 --backup --db-name myapp                     # backup to ./myapp_<date>.dump
+  $0 --backup --db-name myapp --file /tmp/bk.dump # backup to specific file
+  $0 --restore --db-name myapp --file bk.dump     # restore from backup
+  $0 --connection-test --db-name myapp --user mu  # test connectivity
+  $0 --db-info --db-name myapp                    # show database details
   $0 --db-name myapp --user myuser --orm prisma   # partial flags, prompts for rest
-  $0 --db-name myapp --user myuser --password secret --orm prisma --non-interactive
 EOF
 exit 0
 }
@@ -327,6 +343,774 @@ cmd_change_password() {
   echo -e "  ${DIM}Test with:${RESET} ${CYAN}psql -h localhost -p ${port} -U ${target_user} -d postgres${RESET}"
   echo
 
+  exit 0
+}
+
+# ---------------------------
+# Preflight check (reused by commands)
+# ---------------------------
+require_pg() {
+  if ! pg_is_installed; then
+    error "PostgreSQL client (psql) is not installed."
+    exit 1
+  fi
+  if ! pg_is_running; then
+    error "PostgreSQL server is not running."
+    echo -e "  Start it with: ${CYAN}sudo systemctl start postgresql${RESET}"
+    exit 1
+  fi
+}
+
+# ---------------------------
+# Command: list databases
+# ---------------------------
+cmd_list_databases() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}PostgreSQL Databases${RESET}                        ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  require_pg
+
+  echo
+  sudo -u postgres psql -c "
+    SELECT
+      d.datname                                    AS \"Database\",
+      pg_catalog.pg_get_userbyid(d.datdba)         AS \"Owner\",
+      pg_catalog.pg_size_pretty(
+        pg_catalog.pg_database_size(d.datname)
+      )                                            AS \"Size\",
+      d.datcollate                                 AS \"Collation\",
+      COALESCE(
+        (SELECT count(*)::text
+         FROM pg_catalog.pg_stat_user_tables s
+         WHERE s.schemaname = 'public'
+           AND EXISTS (
+             SELECT 1 FROM pg_database db
+             WHERE db.datname = d.datname AND db.oid = (
+               SELECT oid FROM pg_database WHERE datname = current_database()
+             )
+           )
+        ), '-'
+      )                                            AS \"Tables (current db)\"
+    FROM pg_database d
+    WHERE NOT d.datistemplate
+    ORDER BY pg_catalog.pg_database_size(d.datname) DESC;
+  " 2>/dev/null
+
+  # Per-database table counts (connect to each)
+  echo
+  echo -e "${BOLD}Table counts per database:${RESET}"
+  echo
+  local dbs
+  dbs=$(pg_list_databases)
+  if [[ -n "$dbs" ]]; then
+    while IFS= read -r dbname; do
+      local tcount
+      tcount=$(sudo -u postgres psql -tAc \
+        "SELECT count(*) FROM pg_stat_user_tables WHERE schemaname = 'public';" \
+        -d "$dbname" 2>/dev/null || echo "?")
+      local dbsize
+      dbsize=$(sudo -u postgres psql -tAc \
+        "SELECT pg_size_pretty(pg_database_size('${dbname}'));" 2>/dev/null || echo "?")
+      echo -e "  ${WHITE}${dbname}${RESET}  ${DIM}— ${tcount} tables, ${dbsize}${RESET}"
+    done <<< "$dbs"
+  fi
+
+  echo
+  exit 0
+}
+
+# ---------------------------
+# Command: drop database
+# ---------------------------
+cmd_drop_database() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Drop PostgreSQL Database${RESET}                    ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  require_pg
+
+  # Show existing databases
+  echo
+  echo -e "  ${UNDERLINE}Existing databases:${RESET}"
+  local dbs
+  dbs=$(pg_list_databases)
+  if [[ -z "$dbs" ]]; then
+    error "No databases found."
+    exit 1
+  fi
+  while IFS= read -r db; do
+    local dbsize
+    dbsize=$(sudo -u postgres psql -tAc \
+      "SELECT pg_size_pretty(pg_database_size('${db}'));" 2>/dev/null || echo "?")
+    echo -e "    ${DIM}•${RESET} ${db} ${DIM}(${dbsize})${RESET}"
+  done <<< "$dbs"
+  echo
+
+  # Pick database
+  local target_db="$DB_NAME"
+  if [[ -z "$target_db" ]]; then
+    ask "Which database to drop" target_db
+  else
+    info "Database: ${WHITE}${target_db}${RESET} (from flag)"
+  fi
+
+  if ! pg_database_exists "$target_db"; then
+    error "Database '${target_db}' does not exist."
+    exit 1
+  fi
+
+  # Safety: prevent dropping postgres
+  if [[ "$target_db" == "postgres" ]]; then
+    error "Cannot drop the 'postgres' system database."
+    exit 1
+  fi
+
+  # Show what will be lost
+  local tcount dbsize
+  tcount=$(sudo -u postgres psql -tAc \
+    "SELECT count(*) FROM pg_stat_user_tables WHERE schemaname = 'public';" \
+    -d "$target_db" 2>/dev/null || echo "?")
+  dbsize=$(sudo -u postgres psql -tAc \
+    "SELECT pg_size_pretty(pg_database_size('${target_db}'));" 2>/dev/null || echo "?")
+
+  echo
+  echo -e "  ${RED}${BOLD}WARNING: This will permanently delete:${RESET}"
+  echo -e "    Database: ${WHITE}${target_db}${RESET}"
+  echo -e "    Size:     ${WHITE}${dbsize}${RESET}"
+  echo -e "    Tables:   ${WHITE}${tcount}${RESET}"
+  echo
+
+  # Double confirmation
+  ask_yesno "Are you sure you want to drop '${target_db}'?" DROP_CONFIRM "n"
+  if [[ "$DROP_CONFIRM" != "y" ]]; then
+    warn "Aborted."
+    exit 0
+  fi
+
+  echo -en "  ${WHITE}Type the database name to confirm:${RESET} "
+  read -r confirm_name
+  if [[ "$confirm_name" != "$target_db" ]]; then
+    error "Name does not match. Aborted."
+    exit 1
+  fi
+
+  # Terminate connections
+  echo -en "  Terminating active connections ... "
+  sudo -u postgres psql -q -c \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${target_db}' AND pid <> pg_backend_pid();" \
+    >/dev/null 2>&1
+  echo -e "${GREEN}done${RESET}"
+
+  # Drop
+  echo -en "  Dropping database '${target_db}' ... "
+  sudo -u postgres psql -q -c "DROP DATABASE \"${target_db}\";"
+  echo -e "${GREEN}done${RESET}"
+
+  echo
+  success "Database '${target_db}' has been dropped."
+  echo
+
+  exit 0
+}
+
+# ---------------------------
+# Command: drop user
+# ---------------------------
+cmd_drop_user() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Drop PostgreSQL Role${RESET}                        ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  require_pg
+
+  # Show existing roles
+  echo
+  echo -e "  ${UNDERLINE}Existing roles:${RESET}"
+  local roles
+  roles=$(pg_list_roles)
+  if [[ -z "$roles" ]]; then
+    error "No roles found."
+    exit 1
+  fi
+  while IFS= read -r role; do
+    echo -e "    ${DIM}•${RESET} ${role}"
+  done <<< "$roles"
+  echo
+
+  # Pick user
+  local target_user="$DB_USER"
+  if [[ -z "$target_user" ]]; then
+    ask "Which role to drop" target_user
+  else
+    info "User: ${WHITE}${target_user}${RESET} (from flag)"
+  fi
+
+  if ! pg_role_exists "$target_user"; then
+    error "Role '${target_user}' does not exist."
+    exit 1
+  fi
+
+  # Safety: prevent dropping postgres
+  if [[ "$target_user" == "postgres" ]]; then
+    error "Cannot drop the 'postgres' superuser."
+    exit 1
+  fi
+
+  # Check for owned databases
+  local owned_dbs
+  owned_dbs=$(sudo -u postgres psql -tAc \
+    "SELECT datname FROM pg_database WHERE datdba = (SELECT oid FROM pg_roles WHERE rolname = '${target_user}');" \
+    2>/dev/null)
+
+  if [[ -n "$owned_dbs" ]]; then
+    warn "This role owns the following databases:"
+    while IFS= read -r odb; do
+      echo -e "    ${DIM}•${RESET} ${odb}"
+    done <<< "$owned_dbs"
+    echo
+    ask_yesno "Reassign owned objects to 'postgres' before dropping?" REASSIGN "y"
+    if [[ "$REASSIGN" != "y" ]]; then
+      error "Cannot drop a role that owns databases. Reassign or drop them first."
+      exit 1
+    fi
+  fi
+
+  echo
+  echo -e "  ${RED}${BOLD}Will drop role:${RESET} ${WHITE}${target_user}${RESET}"
+  confirm_or_abort
+
+  # Reassign and drop owned
+  echo -en "  Reassigning owned objects ... "
+  sudo -u postgres psql -q -c "REASSIGN OWNED BY \"${target_user}\" TO postgres;"
+  echo -e "${GREEN}done${RESET}"
+
+  echo -en "  Dropping owned objects ... "
+  sudo -u postgres psql -q -c "DROP OWNED BY \"${target_user}\";"
+  echo -e "${GREEN}done${RESET}"
+
+  echo -en "  Dropping role '${target_user}' ... "
+  sudo -u postgres psql -q -c "DROP ROLE \"${target_user}\";"
+  echo -e "${GREEN}done${RESET}"
+
+  echo
+  success "Role '${target_user}' has been dropped."
+  echo
+
+  exit 0
+}
+
+# ---------------------------
+# Command: backup
+# ---------------------------
+cmd_backup() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Backup PostgreSQL Database${RESET}                  ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  require_pg
+
+  # Show databases
+  echo
+  echo -e "  ${UNDERLINE}Available databases:${RESET}"
+  local dbs
+  dbs=$(pg_list_databases)
+  if [[ -z "$dbs" ]]; then
+    error "No databases found."
+    exit 1
+  fi
+  while IFS= read -r db; do
+    local dbsize
+    dbsize=$(sudo -u postgres psql -tAc \
+      "SELECT pg_size_pretty(pg_database_size('${db}'));" 2>/dev/null || echo "?")
+    echo -e "    ${DIM}•${RESET} ${db} ${DIM}(${dbsize})${RESET}"
+  done <<< "$dbs"
+  echo
+
+  # Pick database
+  local target_db="$DB_NAME"
+  if [[ -z "$target_db" ]]; then
+    ask "Database to backup" target_db
+  else
+    info "Database: ${WHITE}${target_db}${RESET} (from flag)"
+  fi
+
+  if ! pg_database_exists "$target_db"; then
+    error "Database '${target_db}' does not exist."
+    exit 1
+  fi
+
+  # Format
+  local fmt="${BACKUP_FORMAT:-}"
+  if [[ -z "$fmt" ]]; then
+    echo -e "  ${WHITE}Backup format:${RESET}"
+    echo -e "    ${CYAN}1)${RESET} custom    ${DIM}— compressed, supports pg_restore (recommended)${RESET}"
+    echo -e "    ${CYAN}2)${RESET} plain     ${DIM}— plain SQL text file${RESET}"
+    echo -e "    ${CYAN}3)${RESET} directory ${DIM}— directory with per-table files${RESET}"
+    while true; do
+      echo -en "  ${WHITE}Choose [1-3]${RESET} ${DIM}(1)${RESET}: "
+      read -r fmt_choice
+      fmt_choice="${fmt_choice:-1}"
+      case "$fmt_choice" in
+        1) fmt="custom";    break ;;
+        2) fmt="plain";     break ;;
+        3) fmt="directory"; break ;;
+        *) error "Invalid choice." ;;
+      esac
+    done
+  fi
+
+  # File path
+  local backup_file="$BACKUP_FILE"
+  if [[ -z "$backup_file" ]]; then
+    local ext="dump"
+    [[ "$fmt" == "plain" ]] && ext="sql"
+    [[ "$fmt" == "directory" ]] && ext="dir"
+    local default_file="./${target_db}_$(date +%Y%m%d_%H%M%S).${ext}"
+    ask "Output file" backup_file "$default_file"
+  else
+    info "File: ${WHITE}${backup_file}${RESET} (from flag)"
+  fi
+
+  # Build pg_dump flags
+  local dump_flags=()
+  case "$fmt" in
+    custom)    dump_flags+=(-Fc) ;;
+    plain)     dump_flags+=(-Fp) ;;
+    directory) dump_flags+=(-Fd) ;;
+  esac
+  dump_flags+=(-v -d "$target_db" -f "$backup_file")
+
+  # Review
+  local dbsize
+  dbsize=$(sudo -u postgres psql -tAc \
+    "SELECT pg_size_pretty(pg_database_size('${target_db}'));" 2>/dev/null || echo "?")
+  echo
+  echo -e "  ${BOLD}Backup plan:${RESET}"
+  echo -e "    Database: ${WHITE}${target_db}${RESET} (${dbsize})"
+  echo -e "    Format:   ${WHITE}${fmt}${RESET}"
+  echo -e "    File:     ${WHITE}${backup_file}${RESET}"
+  confirm_or_abort
+
+  # Execute
+  echo -en "  Backing up '${target_db}' ... "
+  sudo -u postgres pg_dump "${dump_flags[@]}" 2>/dev/null
+  echo -e "${GREEN}done${RESET}"
+
+  # Show result
+  if [[ "$fmt" == "directory" ]]; then
+    local dir_size
+    dir_size=$(du -sh "$backup_file" 2>/dev/null | awk '{print $1}')
+    echo
+    success "Backup saved to ${backup_file}/ (${dir_size})"
+  else
+    local file_size
+    file_size=$(ls -lh "$backup_file" 2>/dev/null | awk '{print $5}')
+    echo
+    success "Backup saved to ${backup_file} (${file_size})"
+  fi
+
+  echo -e "  ${DIM}Restore with:${RESET} ${CYAN}$0 --restore --db-name ${target_db} --file ${backup_file}${RESET}"
+  echo
+
+  exit 0
+}
+
+# ---------------------------
+# Command: restore
+# ---------------------------
+cmd_restore() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Restore PostgreSQL Database${RESET}                 ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  require_pg
+
+  # File
+  local restore_file="$BACKUP_FILE"
+  if [[ -z "$restore_file" ]]; then
+    # List .dump/.sql files in current dir
+    local found_files
+    found_files=$(ls -1t *.dump *.sql *.dir 2>/dev/null | head -10)
+    if [[ -n "$found_files" ]]; then
+      echo
+      echo -e "  ${UNDERLINE}Recent backup files in current directory:${RESET}"
+      while IFS= read -r f; do
+        local fsize
+        fsize=$(ls -lh "$f" 2>/dev/null | awk '{print $5}')
+        echo -e "    ${DIM}•${RESET} ${f} ${DIM}(${fsize})${RESET}"
+      done <<< "$found_files"
+    fi
+    echo
+    ask "Backup file to restore from" restore_file
+  else
+    info "File: ${WHITE}${restore_file}${RESET} (from flag)"
+  fi
+
+  if [[ ! -e "$restore_file" ]]; then
+    error "File '${restore_file}' not found."
+    exit 1
+  fi
+
+  # Target database
+  local target_db="$DB_NAME"
+  if [[ -z "$target_db" ]]; then
+    echo
+    echo -e "  ${UNDERLINE}Existing databases:${RESET}"
+    local dbs
+    dbs=$(pg_list_databases)
+    if [[ -n "$dbs" ]]; then
+      while IFS= read -r db; do
+        echo -e "    ${DIM}•${RESET} ${db}"
+      done <<< "$dbs"
+    fi
+    echo
+    ask "Target database name" target_db
+  else
+    info "Database: ${WHITE}${target_db}${RESET} (from flag)"
+  fi
+
+  # Create database if it doesn't exist
+  local db_created="n"
+  if ! pg_database_exists "$target_db"; then
+    ask_yesno "Database '${target_db}' doesn't exist. Create it?" CREATE_DB "y"
+    if [[ "$CREATE_DB" == "y" ]]; then
+      db_created="y"
+    else
+      error "Cannot restore to non-existent database."
+      exit 1
+    fi
+  fi
+
+  # Detect format
+  local is_plain="n"
+  if file "$restore_file" 2>/dev/null | grep -qi "text\|sql\|ascii"; then
+    is_plain="y"
+  fi
+  if [[ -d "$restore_file" ]]; then
+    is_plain="directory"
+  fi
+
+  # Review
+  local fsize
+  if [[ -d "$restore_file" ]]; then
+    fsize=$(du -sh "$restore_file" 2>/dev/null | awk '{print $1}')
+  else
+    fsize=$(ls -lh "$restore_file" 2>/dev/null | awk '{print $5}')
+  fi
+
+  echo
+  echo -e "  ${BOLD}Restore plan:${RESET}"
+  echo -e "    File:     ${WHITE}${restore_file}${RESET} (${fsize})"
+  echo -e "    Database: ${WHITE}${target_db}${RESET}"
+  if [[ "$db_created" == "y" ]]; then
+    echo -e "    ${DIM}(database will be created)${RESET}"
+  else
+    echo -e "    ${YELLOW}⚠ Existing data may be overwritten${RESET}"
+  fi
+  confirm_or_abort
+
+  # Create db if needed
+  if [[ "$db_created" == "y" ]]; then
+    echo -en "  Creating database '${target_db}' ... "
+    sudo -u postgres psql -q -c "CREATE DATABASE \"${target_db}\";"
+    echo -e "${GREEN}done${RESET}"
+  fi
+
+  # Restore
+  echo -en "  Restoring into '${target_db}' ... "
+  if [[ "$is_plain" == "y" ]]; then
+    sudo -u postgres psql -q -d "$target_db" < "$restore_file" 2>/dev/null
+  else
+    sudo -u postgres pg_restore -d "$target_db" --no-owner --no-privileges \
+      --clean --if-exists "$restore_file" 2>/dev/null || true
+  fi
+  echo -e "${GREEN}done${RESET}"
+
+  # Verify
+  local tcount
+  tcount=$(sudo -u postgres psql -tAc \
+    "SELECT count(*) FROM pg_stat_user_tables WHERE schemaname = 'public';" \
+    -d "$target_db" 2>/dev/null || echo "?")
+  local dbsize
+  dbsize=$(sudo -u postgres psql -tAc \
+    "SELECT pg_size_pretty(pg_database_size('${target_db}'));" 2>/dev/null || echo "?")
+
+  echo
+  success "Restore complete — ${tcount} tables, ${dbsize}"
+  echo
+
+  exit 0
+}
+
+# ---------------------------
+# Command: connection test
+# ---------------------------
+cmd_connection_test() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Test PostgreSQL Connection${RESET}                  ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  require_pg
+
+  local port
+  port=$(pg_port 2>/dev/null || echo "5432")
+
+  # Pick database
+  local target_db="$DB_NAME"
+  if [[ -z "$target_db" ]]; then
+    echo
+    echo -e "  ${UNDERLINE}Existing databases:${RESET}"
+    local dbs
+    dbs=$(pg_list_databases)
+    if [[ -n "$dbs" ]]; then
+      while IFS= read -r db; do
+        echo -e "    ${DIM}•${RESET} ${db}"
+      done <<< "$dbs"
+    fi
+    echo
+    ask "Database to connect to" target_db
+  else
+    info "Database: ${WHITE}${target_db}${RESET} (from flag)"
+  fi
+
+  # Pick user
+  local target_user="$DB_USER"
+  if [[ -z "$target_user" ]]; then
+    echo
+    echo -e "  ${UNDERLINE}Existing roles:${RESET}"
+    local roles
+    roles=$(pg_list_roles)
+    if [[ -n "$roles" ]]; then
+      while IFS= read -r r; do
+        echo -e "    ${DIM}•${RESET} ${r}"
+      done <<< "$roles"
+    fi
+    echo
+    ask "User to connect as" target_user
+  else
+    info "User: ${WHITE}${target_user}${RESET} (from flag)"
+  fi
+
+  # Password
+  local target_pass="$DB_PASS"
+  if [[ -z "$target_pass" ]]; then
+    ask_secret "Password for '${target_user}'" target_pass
+  fi
+
+  echo
+  echo -e "  ${BOLD}Testing connection:${RESET}"
+  echo -e "    ${CYAN}postgresql://${target_user}:****@localhost:${port}/${target_db}${RESET}"
+  echo
+
+  # Test 1: pg_isready
+  echo -en "  Server reachable .............. "
+  if pg_isready -h localhost -p "$port" &>/dev/null; then
+    echo -e "${GREEN}PASS${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET}"
+    error "Server not reachable on localhost:${port}"
+    exit 1
+  fi
+
+  # Test 2: authentication
+  echo -en "  Authentication ................ "
+  if PGPASSWORD="$target_pass" psql -h localhost -p "$port" -U "$target_user" \
+     -d "$target_db" -tAc "SELECT 1;" &>/dev/null; then
+    echo -e "${GREEN}PASS${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET}"
+    error "Authentication failed. Check password and pg_hba.conf."
+    echo -e "  ${DIM}pg_hba.conf: $(pg_hba_file)${RESET}"
+    exit 1
+  fi
+
+  # Test 3: basic privileges
+  echo -en "  SELECT privilege .............. "
+  if PGPASSWORD="$target_pass" psql -h localhost -p "$port" -U "$target_user" \
+     -d "$target_db" -tAc "SELECT current_user, current_database();" &>/dev/null; then
+    echo -e "${GREEN}PASS${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET}"
+  fi
+
+  # Test 4: schema access
+  echo -en "  Schema 'public' access ........ "
+  if PGPASSWORD="$target_pass" psql -h localhost -p "$port" -U "$target_user" \
+     -d "$target_db" -tAc "SELECT has_schema_privilege('${target_user}', 'public', 'USAGE');" \
+     2>/dev/null | grep -q "t"; then
+    echo -e "${GREEN}PASS${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET}"
+  fi
+
+  # Test 5: write privilege (try create temp table)
+  echo -en "  TEMP table creation ........... "
+  if PGPASSWORD="$target_pass" psql -h localhost -p "$port" -U "$target_user" \
+     -d "$target_db" -tAc "CREATE TEMP TABLE _conntest_tmp (id int); DROP TABLE _conntest_tmp;" \
+     &>/dev/null; then
+    echo -e "${GREEN}PASS${RESET}"
+  else
+    echo -e "${YELLOW}SKIP${RESET} ${DIM}(no TEMP privilege)${RESET}"
+  fi
+
+  # Show connection info
+  echo
+  local server_ver
+  server_ver=$(PGPASSWORD="$target_pass" psql -h localhost -p "$port" -U "$target_user" \
+     -d "$target_db" -tAc "SHOW server_version;" 2>/dev/null || echo "?")
+  success "Connection OK — PostgreSQL ${server_ver}"
+  echo -e "  ${DIM}Connection string:${RESET}"
+  echo -e "  ${CYAN}postgresql://${target_user}:<password>@localhost:${port}/${target_db}${RESET}"
+  echo
+
+  exit 0
+}
+
+# ---------------------------
+# Command: database info
+# ---------------------------
+cmd_db_info() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Database Info${RESET}                                ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  require_pg
+
+  # Pick database
+  local target_db="$DB_NAME"
+  if [[ -z "$target_db" ]]; then
+    echo
+    echo -e "  ${UNDERLINE}Existing databases:${RESET}"
+    local dbs
+    dbs=$(pg_list_databases)
+    if [[ -n "$dbs" ]]; then
+      while IFS= read -r db; do
+        echo -e "    ${DIM}•${RESET} ${db}"
+      done <<< "$dbs"
+    fi
+    echo
+    ask "Database to inspect" target_db
+  else
+    info "Database: ${WHITE}${target_db}${RESET} (from flag)"
+  fi
+
+  if ! pg_database_exists "$target_db"; then
+    error "Database '${target_db}' does not exist."
+    exit 1
+  fi
+
+  # General info
+  local dbsize owner encoding collation
+  dbsize=$(sudo -u postgres psql -tAc \
+    "SELECT pg_size_pretty(pg_database_size('${target_db}'));" 2>/dev/null)
+  owner=$(sudo -u postgres psql -tAc \
+    "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname = '${target_db}';" \
+    2>/dev/null)
+  encoding=$(sudo -u postgres psql -tAc \
+    "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = '${target_db}';" \
+    2>/dev/null)
+  collation=$(sudo -u postgres psql -tAc \
+    "SELECT datcollate FROM pg_database WHERE datname = '${target_db}';" 2>/dev/null)
+
+  echo
+  echo -e "  ${DIM}Database .......${RESET} ${WHITE}${target_db}${RESET}"
+  echo -e "  ${DIM}Owner ..........${RESET} ${WHITE}${owner}${RESET}"
+  echo -e "  ${DIM}Size ...........${RESET} ${WHITE}${dbsize}${RESET}"
+  echo -e "  ${DIM}Encoding .......${RESET} ${WHITE}${encoding}${RESET}"
+  echo -e "  ${DIM}Collation ......${RESET} ${WHITE}${collation}${RESET}"
+
+  # Active connections
+  local conn_count
+  conn_count=$(sudo -u postgres psql -tAc \
+    "SELECT count(*) FROM pg_stat_activity WHERE datname = '${target_db}';" 2>/dev/null)
+  echo -e "  ${DIM}Connections ....${RESET} ${WHITE}${conn_count} active${RESET}"
+
+  # Tables
+  echo
+  echo -e "  ${UNDERLINE}Tables (public schema):${RESET}"
+  echo
+  local tables_output
+  tables_output=$(sudo -u postgres psql -d "$target_db" -c "
+    SELECT
+      t.tablename                                  AS \"Table\",
+      pg_size_pretty(
+        pg_total_relation_size(quote_ident(t.tablename))
+      )                                            AS \"Total Size\",
+      pg_size_pretty(
+        pg_relation_size(quote_ident(t.tablename))
+      )                                            AS \"Data Size\",
+      pg_size_pretty(
+        pg_indexes_size(quote_ident(t.tablename))
+      )                                            AS \"Index Size\",
+      COALESCE(s.n_live_tup, 0)                    AS \"Est. Rows\"
+    FROM pg_tables t
+    LEFT JOIN pg_stat_user_tables s
+      ON s.relname = t.tablename AND s.schemaname = t.schemaname
+    WHERE t.schemaname = 'public'
+    ORDER BY pg_total_relation_size(quote_ident(t.tablename)) DESC;
+  " 2>/dev/null)
+
+  if echo "$tables_output" | grep -q "(0 rows)"; then
+    echo -e "  ${DIM}(no tables)${RESET}"
+  else
+    echo "$tables_output"
+  fi
+
+  # Indexes
+  echo
+  echo -e "  ${UNDERLINE}Indexes:${RESET}"
+  echo
+  sudo -u postgres psql -d "$target_db" -c "
+    SELECT
+      indexname                                     AS \"Index\",
+      tablename                                     AS \"Table\",
+      pg_size_pretty(pg_relation_size(quote_ident(indexname)))  AS \"Size\"
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+    ORDER BY pg_relation_size(quote_ident(indexname)) DESC
+    LIMIT 20;
+  " 2>/dev/null
+
+  # Extensions
+  echo
+  echo -e "  ${UNDERLINE}Extensions:${RESET}"
+  echo
+  sudo -u postgres psql -d "$target_db" -c "
+    SELECT extname AS \"Extension\", extversion AS \"Version\"
+    FROM pg_extension
+    ORDER BY extname;
+  " 2>/dev/null
+
+  # Roles with access
+  echo
+  echo -e "  ${UNDERLINE}Roles with access:${RESET}"
+  echo
+  sudo -u postgres psql -c "
+    SELECT
+      r.rolname AS \"Role\",
+      CASE
+        WHEN d.datdba = r.oid THEN 'owner'
+        WHEN has_database_privilege(r.oid, d.oid, 'CONNECT') THEN 'connect'
+        ELSE 'none'
+      END AS \"Access\"
+    FROM pg_database d
+    CROSS JOIN pg_roles r
+    WHERE d.datname = '${target_db}'
+      AND r.rolname NOT LIKE 'pg_%'
+      AND r.rolcanlogin
+      AND (d.datdba = r.oid OR has_database_privilege(r.oid, d.oid, 'CONNECT'))
+    ORDER BY r.rolname;
+  " 2>/dev/null
+
+  echo
   exit 0
 }
 
@@ -732,6 +1516,15 @@ DB_ALREADY_EXISTS="n"
 ROLE_ALREADY_EXISTS="n"
 CMD_LIST_USERS="n"
 CMD_CHANGE_PASS="n"
+CMD_LIST_DBS="n"
+CMD_DROP_DB="n"
+CMD_DROP_USER="n"
+CMD_BACKUP="n"
+CMD_RESTORE="n"
+CMD_CONN_TEST="n"
+CMD_DB_INFO="n"
+BACKUP_FILE=""
+BACKUP_FORMAT=""
 
 # ---------------------------
 # Parse flags
@@ -740,8 +1533,22 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --list-users)
       CMD_LIST_USERS="y"; shift ;;
+    --list-databases)
+      CMD_LIST_DBS="y"; shift ;;
     --change-password)
       CMD_CHANGE_PASS="y"; shift ;;
+    --drop-database)
+      CMD_DROP_DB="y"; shift ;;
+    --drop-user)
+      CMD_DROP_USER="y"; shift ;;
+    --backup)
+      CMD_BACKUP="y"; shift ;;
+    --restore)
+      CMD_RESTORE="y"; shift ;;
+    --connection-test)
+      CMD_CONN_TEST="y"; shift ;;
+    --db-info)
+      CMD_DB_INFO="y"; shift ;;
     --db-name)
       DB_NAME="$2"; shift 2 ;;
     --user)
@@ -750,6 +1557,10 @@ while [[ $# -gt 0 ]]; do
       DB_PASS="$2"; shift 2 ;;
     --orm)
       ORM="$2"; shift 2 ;;
+    --file)
+      BACKUP_FILE="$2"; shift 2 ;;
+    --format)
+      BACKUP_FORMAT="$2"; shift 2 ;;
     --owner)
       MAKE_OWNER="y"; shift ;;
     --existing-user)
@@ -768,8 +1579,15 @@ done
 # ---------------------------
 # Dispatch commands
 # ---------------------------
-[[ "$CMD_LIST_USERS" == "y" ]] && cmd_list_users
+[[ "$CMD_LIST_USERS" == "y" ]]  && cmd_list_users
+[[ "$CMD_LIST_DBS" == "y" ]]    && cmd_list_databases
 [[ "$CMD_CHANGE_PASS" == "y" ]] && cmd_change_password
+[[ "$CMD_DROP_DB" == "y" ]]     && cmd_drop_database
+[[ "$CMD_DROP_USER" == "y" ]]   && cmd_drop_user
+[[ "$CMD_BACKUP" == "y" ]]      && cmd_backup
+[[ "$CMD_RESTORE" == "y" ]]     && cmd_restore
+[[ "$CMD_CONN_TEST" == "y" ]]   && cmd_connection_test
+[[ "$CMD_DB_INFO" == "y" ]]     && cmd_db_info
 
 # ---------------------------
 # Non-interactive validation
