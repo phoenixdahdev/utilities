@@ -1,0 +1,797 @@
+#!/bin/bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════
+#  server-setup — Production server provisioner (Ubuntu/Debian)
+# ═══════════════════════════════════════════════════════════════
+
+# ---------------------------
+# Colors & formatting
+# ---------------------------
+BOLD='\033[1m'
+DIM='\033[2m'
+UNDERLINE='\033[4m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+RESET='\033[0m'
+
+info()    { echo -e "${BLUE}ℹ${RESET}  $1"; }
+success() { echo -e "${GREEN}✔${RESET}  $1"; }
+warn()    { echo -e "${YELLOW}⚠${RESET}  $1"; }
+error()   { echo -e "${RED}✖${RESET}  $1"; }
+step()    { echo -e "\n${BOLD}${CYAN}[$1]${RESET} ${BOLD}$2${RESET}"; }
+divider() { echo -e "${DIM}$(printf '─%.0s' {1..60})${RESET}"; }
+
+ask_yesno() {
+  local prompt="$1" var="$2" default="${3:-n}"
+  local hint
+  if [[ "$default" == "y" ]]; then hint="Y/n"; else hint="y/N"; fi
+  echo -en "  ${WHITE}${prompt}${RESET} ${DIM}(${hint})${RESET}: "
+  read -r input
+  input="${input:-$default}"
+  if [[ "${input,,}" == "y" || "${input,,}" == "yes" ]]; then
+    eval "$var='y'"
+  else
+    eval "$var='n'"
+  fi
+}
+
+ask() {
+  local prompt="$1" var="$2" default="${3:-}"
+  if [[ -n "$default" ]]; then
+    echo -en "  ${WHITE}${prompt}${RESET} ${DIM}(${default})${RESET}: "
+    read -r input
+    eval "$var='${input:-$default}'"
+  else
+    echo -en "  ${WHITE}${prompt}${RESET}: "
+    read -r input
+    eval "$var='$input'"
+  fi
+}
+
+ask_secret() {
+  local prompt="$1" var="$2"
+  echo -en "  ${WHITE}${prompt}${RESET}: "
+  read -rs input
+  echo
+  eval "$var='$input'"
+}
+
+confirm_or_abort() {
+  echo
+  ask_yesno "Proceed?" CONFIRM "n"
+  if [[ "$CONFIRM" != "y" ]]; then
+    echo
+    warn "Aborted."
+    exit 0
+  fi
+}
+
+has_cmd() { command -v "$1" &>/dev/null; }
+
+show_help() {
+cat <<EOF
+Usage: $0 [options]
+
+Production server provisioner for Ubuntu/Debian.
+Run without flags for a guided wizard.
+
+Options:
+  --all                Install & configure everything
+  --skip-detect        Skip environment detection
+  --deploy-user NAME   Name for the deploy user (default: deploy)
+  --help               Show this help
+
+Modules:
+  System         apt update/upgrade, essentials, timezone, locale
+  Security       deploy user, SSH hardening, UFW, fail2ban, unattended-upgrades
+  Swap           create swap file if none exists
+  Node.js        NVM + Node.js LTS + PM2
+  Python         python3 + pip + venv
+  PostgreSQL     latest from PGDG, started + enabled
+  nginx          install, harden, enable
+  Certbot        Let's Encrypt + auto-renewal
+  Redis          install, bind localhost, enable
+  Docker         Docker Engine + compose + user group
+  Logrotate      configure app log rotation
+EOF
+exit 0
+}
+
+# ---------------------------
+# Detect current environment
+# ---------------------------
+show_environment() {
+  step "1" "Server Environment"
+  divider
+
+  local os_name kernel arch mem swap disk cpus uptime_str
+  os_name=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "Unknown")
+  kernel=$(uname -r)
+  arch=$(uname -m)
+  mem=$(free -h | awk '/Mem:/{print $2}')
+  swap=$(free -h | awk '/Swap:/{print $2}')
+  disk=$(df -h / | awk 'NR==2{print $4 " free / " $2 " total (" $5 " used)"}')
+  cpus=$(nproc)
+  uptime_str=$(uptime -p 2>/dev/null || echo "unknown")
+
+  echo -e "  ${DIM}OS .............${RESET} ${WHITE}${os_name}${RESET}"
+  echo -e "  ${DIM}Kernel .........${RESET} ${WHITE}${kernel} (${arch})${RESET}"
+  echo -e "  ${DIM}CPU ............${RESET} ${WHITE}${cpus} cores${RESET}"
+  echo -e "  ${DIM}Memory .........${RESET} ${WHITE}${mem}${RESET}"
+  echo -e "  ${DIM}Swap ...........${RESET} ${WHITE}${swap}${RESET}"
+  echo -e "  ${DIM}Disk ...........${RESET} ${WHITE}${disk}${RESET}"
+  echo -e "  ${DIM}Uptime .........${RESET} ${WHITE}${uptime_str}${RESET}"
+
+  # Public IP
+  local pub_ip
+  pub_ip=$(curl -fsSL --max-time 3 ifconfig.me 2>/dev/null || echo "unknown")
+  echo -e "  ${DIM}Public IP ......${RESET} ${WHITE}${pub_ip}${RESET}"
+
+  echo
+  echo -e "  ${UNDERLINE}Installed services:${RESET}"
+  local svc
+  for svc in nginx postgresql redis-server docker fail2ban ufw ssh; do
+    if systemctl list-unit-files "${svc}*" &>/dev/null 2>&1 && \
+       systemctl is-active "$svc" &>/dev/null 2>&1; then
+      echo -e "    ${GREEN}●${RESET} ${svc} (active)"
+    elif systemctl list-unit-files "${svc}*" &>/dev/null 2>&1 && \
+         systemctl is-enabled "$svc" &>/dev/null 2>&1; then
+      echo -e "    ${YELLOW}●${RESET} ${svc} (installed, inactive)"
+    else
+      echo -e "    ${DIM}○${RESET} ${svc}"
+    fi
+  done
+
+  echo
+  echo -e "  ${UNDERLINE}Tools:${RESET}"
+  for tool in git curl node npm pm2 python3 psql certbot docker; do
+    if has_cmd "$tool"; then
+      local ver
+      ver=$("$tool" --version 2>/dev/null | head -1 || echo "")
+      echo -e "    ${GREEN}✔${RESET} ${tool} ${DIM}${ver}${RESET}"
+    else
+      echo -e "    ${RED}✖${RESET} ${tool}"
+    fi
+  done
+}
+
+# ---------------------------
+# Module flags
+# ---------------------------
+DO_SYSTEM="n"
+DO_SECURITY="n"
+DO_SWAP="n"
+DO_NODE="n"
+DO_PYTHON="n"
+DO_POSTGRES="n"
+DO_NGINX="n"
+DO_CERTBOT="n"
+DO_REDIS="n"
+DO_DOCKER="n"
+DO_LOGROTATE="n"
+INSTALL_ALL="n"
+SKIP_DETECT="n"
+DEPLOY_USER="deploy"
+
+# ---------------------------
+# Parse flags
+# ---------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)           INSTALL_ALL="y"; shift ;;
+    --skip-detect)   SKIP_DETECT="y"; shift ;;
+    --deploy-user)   DEPLOY_USER="$2"; shift 2 ;;
+    --help|-h)       show_help ;;
+    *)               error "Unknown option: $1"; echo; show_help ;;
+  esac
+done
+
+# ---------------------------
+# Choose modules
+# ---------------------------
+choose_modules() {
+  step "2" "What to set up"
+  divider
+
+  if [[ "$INSTALL_ALL" == "y" ]]; then
+    DO_SYSTEM="y" DO_SECURITY="y" DO_SWAP="y" DO_NODE="y" DO_PYTHON="y"
+    DO_POSTGRES="y" DO_NGINX="y" DO_CERTBOT="y" DO_REDIS="y" DO_DOCKER="y"
+    DO_LOGROTATE="y"
+    info "All modules selected (--all)"
+    return
+  fi
+
+  echo -e "  ${DIM}Select modules for this server.${RESET}"
+  echo
+
+  echo -e "  ${BOLD}── Foundation ──${RESET}"
+  ask_yesno "System update + essentials (git, curl, wget, htop, etc.)" DO_SYSTEM "y"
+  ask_yesno "Security (deploy user, SSH hardening, UFW, fail2ban, auto-updates)" DO_SECURITY "y"
+  ask_yesno "Swap file (recommended if RAM < 4GB)" DO_SWAP "y"
+
+  echo
+  echo -e "  ${BOLD}── Runtimes ──${RESET}"
+  ask_yesno "Node.js (NVM + LTS + PM2)" DO_NODE "y"
+  ask_yesno "Python3 + pip + venv" DO_PYTHON "y"
+
+  echo
+  echo -e "  ${BOLD}── Services ──${RESET}"
+  ask_yesno "PostgreSQL (latest, PGDG repo)" DO_POSTGRES "y"
+  ask_yesno "nginx (install + harden)" DO_NGINX "y"
+  ask_yesno "Certbot (Let's Encrypt SSL)" DO_CERTBOT "n"
+  ask_yesno "Redis (bind localhost)" DO_REDIS "n"
+  ask_yesno "Docker Engine + Compose" DO_DOCKER "n"
+
+  echo
+  echo -e "  ${BOLD}── Maintenance ──${RESET}"
+  ask_yesno "Logrotate config for app logs" DO_LOGROTATE "y"
+
+  # Collect deploy user name if security module selected
+  if [[ "$DO_SECURITY" == "y" ]]; then
+    echo
+    ask "Deploy user name" DEPLOY_USER "$DEPLOY_USER"
+  fi
+}
+
+# ---------------------------
+# Review plan
+# ---------------------------
+show_plan() {
+  step "3" "Review"
+  divider
+  echo
+  echo -e "  ${BOLD}Will configure:${RESET}"
+
+  local count=0
+  [[ "$DO_SYSTEM" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} System update, essentials, timezone, locale"; ((count++)); }
+  [[ "$DO_SECURITY" == "y" ]]  && { echo -e "    ${GREEN}•${RESET} Security: user '${DEPLOY_USER}', SSH hardening, UFW, fail2ban, unattended-upgrades"; ((count++)); }
+  [[ "$DO_SWAP" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} Swap file (1GB or match RAM, whichever is smaller)"; ((count++)); }
+  [[ "$DO_NODE" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} NVM + Node.js LTS + PM2"; ((count++)); }
+  [[ "$DO_PYTHON" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Python3 + pip + venv"; ((count++)); }
+  [[ "$DO_POSTGRES" == "y" ]]  && { echo -e "    ${GREEN}•${RESET} PostgreSQL (PGDG)"; ((count++)); }
+  [[ "$DO_NGINX" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} nginx (hardened headers)"; ((count++)); }
+  [[ "$DO_CERTBOT" == "y" ]]   && { echo -e "    ${GREEN}•${RESET} Certbot + auto-renewal timer"; ((count++)); }
+  [[ "$DO_REDIS" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Redis (localhost only)"; ((count++)); }
+  [[ "$DO_DOCKER" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Docker Engine + Compose"; ((count++)); }
+  [[ "$DO_LOGROTATE" == "y" ]] && { echo -e "    ${GREEN}•${RESET} Logrotate for /var/log/apps/"; ((count++)); }
+
+  if [[ "$count" -eq 0 ]]; then
+    warn "Nothing selected."
+    exit 0
+  fi
+
+  echo -e "\n  ${DIM}${count} module(s) selected.${RESET}"
+
+  if [[ "$DO_SECURITY" == "y" ]]; then
+    echo
+    warn "SSH will be hardened: root login disabled, password auth disabled."
+    warn "Make sure you have SSH key access to '${DEPLOY_USER}' before disconnecting!"
+  fi
+
+  confirm_or_abort
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  Module installers
+# ═══════════════════════════════════════════════════════════════
+
+setup_system() {
+  step "▸" "System essentials"
+
+  info "Updating package lists ..."
+  sudo apt update -qq
+
+  info "Upgrading packages ..."
+  sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq >/dev/null
+
+  info "Installing essentials ..."
+  sudo apt install -y -qq \
+    git curl wget htop tree unzip zip jq \
+    build-essential software-properties-common \
+    ca-certificates gnupg lsb-release \
+    apt-transport-https net-tools \
+    >/dev/null
+
+  # Timezone
+  local current_tz
+  current_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "unknown")
+  info "Timezone is ${current_tz}"
+  ask_yesno "Change timezone? (current: ${current_tz})" CHANGE_TZ "n"
+  if [[ "$CHANGE_TZ" == "y" ]]; then
+    ask "Timezone" NEW_TZ "UTC"
+    sudo timedatectl set-timezone "$NEW_TZ"
+    success "Timezone set to $NEW_TZ"
+  fi
+
+  # Locale
+  if ! locale 2>/dev/null | grep -q "en_US.UTF-8"; then
+    info "Setting locale to en_US.UTF-8 ..."
+    sudo locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
+    sudo update-locale LANG=en_US.UTF-8 >/dev/null 2>&1 || true
+  fi
+
+  success "System essentials done"
+}
+
+setup_security() {
+  step "▸" "Security hardening"
+
+  # Deploy user
+  if id "$DEPLOY_USER" &>/dev/null; then
+    success "User '${DEPLOY_USER}' already exists"
+  else
+    info "Creating user '${DEPLOY_USER}' ..."
+    sudo adduser --disabled-password --gecos "" "$DEPLOY_USER"
+    sudo usermod -aG sudo "$DEPLOY_USER"
+    success "User '${DEPLOY_USER}' created with sudo access"
+  fi
+
+  # Copy SSH keys from current user to deploy user
+  if [[ -d "$HOME/.ssh" ]] && [[ -f "$HOME/.ssh/authorized_keys" ]]; then
+    sudo mkdir -p "/home/${DEPLOY_USER}/.ssh"
+    sudo cp "$HOME/.ssh/authorized_keys" "/home/${DEPLOY_USER}/.ssh/authorized_keys"
+    sudo chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "/home/${DEPLOY_USER}/.ssh"
+    sudo chmod 700 "/home/${DEPLOY_USER}/.ssh"
+    sudo chmod 600 "/home/${DEPLOY_USER}/.ssh/authorized_keys"
+    success "SSH keys copied to '${DEPLOY_USER}'"
+  else
+    warn "No SSH keys found to copy — add keys to /home/${DEPLOY_USER}/.ssh/authorized_keys manually"
+  fi
+
+  # Allow deploy user to sudo without password (for deployments)
+  echo "${DEPLOY_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/${DEPLOY_USER}" >/dev/null
+  sudo chmod 440 "/etc/sudoers.d/${DEPLOY_USER}"
+  success "Passwordless sudo configured for '${DEPLOY_USER}'"
+
+  # SSH hardening
+  local sshd_config="/etc/ssh/sshd_config"
+  if [[ -f "$sshd_config" ]]; then
+    info "Hardening SSH ..."
+    sudo cp "$sshd_config" "${sshd_config}.backup.$(date +%Y%m%d%H%M%S)"
+
+    # Apply hardening via drop-in to avoid breaking existing config
+    sudo tee /etc/ssh/sshd_config.d/99-hardening.conf >/dev/null <<'SSHEOF'
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+X11Forwarding no
+MaxAuthTries 3
+AllowAgentForwarding no
+SSHEOF
+    sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || true
+    success "SSH hardened (root login disabled, password auth disabled)"
+  fi
+
+  # UFW
+  if ! has_cmd ufw; then
+    sudo apt install -y -qq ufw >/dev/null
+  fi
+  info "Configuring UFW ..."
+  sudo ufw default deny incoming >/dev/null
+  sudo ufw default allow outgoing >/dev/null
+  sudo ufw allow ssh >/dev/null
+  sudo ufw allow http >/dev/null
+  sudo ufw allow https >/dev/null
+  sudo ufw --force enable >/dev/null
+  success "UFW enabled (SSH + HTTP + HTTPS)"
+
+  # fail2ban
+  if has_cmd fail2ban-server; then
+    success "fail2ban already installed"
+  else
+    info "Installing fail2ban ..."
+    sudo apt install -y -qq fail2ban >/dev/null
+  fi
+  # Configure jail
+  sudo tee /etc/fail2ban/jail.local >/dev/null <<'F2BEOF'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+port    = ssh
+logpath = %(sshd_log)s
+backend = %(sshd_backend)s
+F2BEOF
+  sudo systemctl restart fail2ban
+  sudo systemctl enable fail2ban >/dev/null 2>&1
+  success "fail2ban configured (SSH jail active)"
+
+  # Unattended upgrades
+  info "Enabling unattended security upgrades ..."
+  sudo apt install -y -qq unattended-upgrades >/dev/null
+  sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'UUEOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+UUEOF
+  success "Unattended security upgrades enabled"
+
+  # System limits for production
+  info "Setting system limits ..."
+  sudo tee /etc/security/limits.d/99-production.conf >/dev/null <<'LIMEOF'
+* soft nofile 65536
+* hard nofile 65536
+* soft nproc  65536
+* hard nproc  65536
+LIMEOF
+  success "File descriptor limits raised (65536)"
+
+  success "Security hardening done"
+}
+
+setup_swap() {
+  step "▸" "Swap file"
+
+  if swapon --show | grep -q "/"; then
+    local current_swap
+    current_swap=$(free -h | awk '/Swap:/{print $2}')
+    success "Swap already active (${current_swap})"
+    return
+  fi
+
+  # Size: 1GB or match RAM, whichever is smaller, capped at 4GB
+  local ram_mb
+  ram_mb=$(free -m | awk '/Mem:/{print $2}')
+  local swap_mb=1024
+  if (( ram_mb < 2048 )); then
+    swap_mb=$ram_mb
+  elif (( ram_mb < 8192 )); then
+    swap_mb=2048
+  else
+    swap_mb=4096
+  fi
+
+  info "Creating ${swap_mb}MB swap file ..."
+  sudo fallocate -l "${swap_mb}M" /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile >/dev/null
+  sudo swapon /swapfile
+
+  # Persist
+  if ! grep -q "/swapfile" /etc/fstab; then
+    echo "/swapfile none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null
+  fi
+
+  # Tuning
+  sudo sysctl vm.swappiness=10 >/dev/null
+  sudo sysctl vm.vfs_cache_pressure=50 >/dev/null
+  if ! grep -q "vm.swappiness" /etc/sysctl.conf; then
+    echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf >/dev/null
+    echo "vm.vfs_cache_pressure=50" | sudo tee -a /etc/sysctl.conf >/dev/null
+  fi
+
+  success "Swap configured (${swap_mb}MB, swappiness=10)"
+}
+
+setup_node() {
+  step "▸" "Node.js (NVM + PM2)"
+
+  local nvm_dir="/home/${DEPLOY_USER}/.config/nvm"
+
+  # Install NVM for deploy user
+  if [[ -s "$nvm_dir/nvm.sh" ]]; then
+    success "NVM already installed for '${DEPLOY_USER}'"
+  else
+    info "Installing NVM for '${DEPLOY_USER}' ..."
+    sudo -u "$DEPLOY_USER" bash -c "
+      export NVM_DIR='$nvm_dir'
+      mkdir -p \"\$NVM_DIR\"
+      curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+    "
+    success "NVM installed at $nvm_dir"
+  fi
+
+  # Install Node LTS
+  info "Installing Node.js LTS ..."
+  sudo -u "$DEPLOY_USER" bash -c "
+    export NVM_DIR='$nvm_dir'
+    [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+    nvm install --lts
+    nvm alias default lts/*
+  "
+  success "Node.js LTS installed"
+
+  # Install PM2 globally
+  info "Installing PM2 ..."
+  sudo -u "$DEPLOY_USER" bash -c "
+    export NVM_DIR='$nvm_dir'
+    [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+    npm install -g pm2
+  "
+  # PM2 startup
+  sudo -u "$DEPLOY_USER" bash -c "
+    export NVM_DIR='$nvm_dir'
+    [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+    pm2 startup systemd -u $DEPLOY_USER --hp /home/$DEPLOY_USER 2>/dev/null || true
+  " || true
+  success "PM2 installed with startup hook"
+}
+
+setup_python() {
+  step "▸" "Python3"
+
+  sudo apt install -y -qq python3 python3-pip python3-venv >/dev/null
+  success "Python3 + pip + venv installed ($(python3 --version))"
+}
+
+setup_postgres() {
+  step "▸" "PostgreSQL"
+
+  if has_cmd psql; then
+    success "PostgreSQL already installed (psql $(psql --version | awk '{print $3}'))"
+  else
+    info "Adding PGDG repository ..."
+    sudo apt install -y -qq curl ca-certificates >/dev/null
+    sudo install -d /usr/share/postgresql-common/pgdg
+    sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
+      sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+    sudo apt update -qq
+    sudo apt install -y -qq postgresql >/dev/null
+    success "PostgreSQL installed"
+  fi
+
+  sudo systemctl start postgresql 2>/dev/null || true
+  sudo systemctl enable postgresql >/dev/null 2>&1 || true
+  success "PostgreSQL running and enabled"
+
+  info "Tip: run ${CYAN}./create-pg-database${RESET} to create databases and users"
+}
+
+setup_nginx() {
+  step "▸" "nginx"
+
+  if has_cmd nginx; then
+    success "nginx already installed"
+  else
+    info "Installing nginx ..."
+    sudo apt install -y -qq nginx >/dev/null
+    success "nginx installed"
+  fi
+
+  # Security headers snippet
+  info "Writing security headers config ..."
+  sudo tee /etc/nginx/snippets/security-headers.conf >/dev/null <<'NGXEOF'
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+NGXEOF
+
+  # Harden nginx.conf
+  info "Hardening nginx.conf ..."
+  # Disable server tokens
+  if ! grep -q "server_tokens off" /etc/nginx/nginx.conf; then
+    sudo sed -i '/http {/a \\tserver_tokens off;' /etc/nginx/nginx.conf
+  fi
+
+  # Increase client_max_body_size
+  if ! grep -q "client_max_body_size" /etc/nginx/nginx.conf; then
+    sudo sed -i '/http {/a \\tclient_max_body_size 64m;' /etc/nginx/nginx.conf
+  fi
+
+  # Gzip
+  if ! grep -q "gzip_types" /etc/nginx/nginx.conf; then
+    sudo tee /etc/nginx/conf.d/gzip.conf >/dev/null <<'GZEOF'
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 4;
+gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript image/svg+xml;
+GZEOF
+  fi
+
+  # Create app sites directory
+  sudo mkdir -p /var/www
+  sudo chown -R "${DEPLOY_USER}:${DEPLOY_USER}" /var/www 2>/dev/null || true
+
+  sudo nginx -t >/dev/null 2>&1 && sudo systemctl reload nginx
+  sudo systemctl start nginx 2>/dev/null || true
+  sudo systemctl enable nginx >/dev/null 2>&1 || true
+  success "nginx running (server_tokens off, security headers, gzip)"
+}
+
+setup_certbot() {
+  step "▸" "Certbot"
+
+  if has_cmd certbot; then
+    success "certbot already installed"
+  else
+    info "Installing certbot ..."
+    sudo apt install -y -qq certbot python3-certbot-nginx >/dev/null
+    success "certbot installed"
+  fi
+
+  # Auto-renewal timer
+  if sudo systemctl is-enabled certbot.timer &>/dev/null; then
+    success "Auto-renewal timer already enabled"
+  else
+    sudo systemctl enable certbot.timer 2>/dev/null || true
+    sudo systemctl start certbot.timer 2>/dev/null || true
+    success "Auto-renewal timer enabled"
+  fi
+
+  echo -e "  ${DIM}Run: sudo certbot --nginx -d yourdomain.com${RESET}"
+}
+
+setup_redis() {
+  step "▸" "Redis"
+
+  if has_cmd redis-cli; then
+    success "Redis already installed"
+  else
+    info "Installing Redis ..."
+    sudo apt install -y -qq redis-server >/dev/null
+    success "Redis installed"
+  fi
+
+  # Bind to localhost only
+  local redis_conf="/etc/redis/redis.conf"
+  if [[ -f "$redis_conf" ]]; then
+    if ! grep -q "^bind 127.0.0.1 ::1" "$redis_conf"; then
+      sudo sed -i 's/^bind .*/bind 127.0.0.1 ::1/' "$redis_conf"
+    fi
+    # Disable protected mode since we bind localhost
+    sudo sed -i 's/^protected-mode .*/protected-mode yes/' "$redis_conf"
+  fi
+
+  sudo systemctl restart redis-server
+  sudo systemctl enable redis-server >/dev/null 2>&1
+  success "Redis running (localhost only)"
+}
+
+setup_docker() {
+  step "▸" "Docker"
+
+  if has_cmd docker; then
+    success "Docker already installed ($(docker --version 2>/dev/null | head -1))"
+  else
+    info "Installing Docker Engine ..."
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+      sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+      sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+    sudo apt update -qq
+    sudo apt install -y -qq docker-ce docker-ce-cli containerd.io \
+      docker-buildx-plugin docker-compose-plugin >/dev/null
+    success "Docker installed"
+  fi
+
+  # Add deploy user to docker group
+  if groups "$DEPLOY_USER" 2>/dev/null | grep -q docker; then
+    success "'${DEPLOY_USER}' already in docker group"
+  else
+    sudo usermod -aG docker "$DEPLOY_USER"
+    success "'${DEPLOY_USER}' added to docker group"
+  fi
+
+  sudo systemctl start docker 2>/dev/null || true
+  sudo systemctl enable docker >/dev/null 2>&1
+  success "Docker running"
+}
+
+setup_logrotate() {
+  step "▸" "Logrotate"
+
+  sudo mkdir -p /var/log/apps
+  sudo chown "${DEPLOY_USER}:${DEPLOY_USER}" /var/log/apps 2>/dev/null || true
+
+  sudo tee /etc/logrotate.d/apps >/dev/null <<'LREOF'
+/var/log/apps/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 deploy deploy
+    sharedscripts
+}
+LREOF
+  success "Logrotate configured (/var/log/apps/*.log, 14 days, compressed)"
+}
+
+# ---------------------------
+# Execute
+# ---------------------------
+run_setup() {
+  step "4" "Installing & configuring"
+  divider
+
+  [[ "$DO_SYSTEM" == "y" ]]    && setup_system
+  [[ "$DO_SECURITY" == "y" ]]  && setup_security
+  [[ "$DO_SWAP" == "y" ]]      && setup_swap
+  [[ "$DO_NODE" == "y" ]]      && setup_node
+  [[ "$DO_PYTHON" == "y" ]]    && setup_python
+  [[ "$DO_POSTGRES" == "y" ]]  && setup_postgres
+  [[ "$DO_NGINX" == "y" ]]     && setup_nginx
+  [[ "$DO_CERTBOT" == "y" ]]   && setup_certbot
+  [[ "$DO_REDIS" == "y" ]]     && setup_redis
+  [[ "$DO_DOCKER" == "y" ]]    && setup_docker
+  [[ "$DO_LOGROTATE" == "y" ]] && setup_logrotate
+}
+
+# ---------------------------
+# Summary
+# ---------------------------
+show_summary() {
+  echo
+  divider
+  echo
+  echo -e "  ${GREEN}${BOLD}✔ Server setup complete!${RESET}"
+  echo
+
+  echo -e "  ${BOLD}Active modules:${RESET}"
+  [[ "$DO_SYSTEM" == "y" ]]    && echo -e "    ${GREEN}•${RESET} System essentials"
+  [[ "$DO_SECURITY" == "y" ]]  && echo -e "    ${GREEN}•${RESET} Security (user: ${WHITE}${DEPLOY_USER}${RESET})"
+  [[ "$DO_SWAP" == "y" ]]      && echo -e "    ${GREEN}•${RESET} Swap"
+  [[ "$DO_NODE" == "y" ]]      && echo -e "    ${GREEN}•${RESET} Node.js + PM2"
+  [[ "$DO_PYTHON" == "y" ]]    && echo -e "    ${GREEN}•${RESET} Python3"
+  [[ "$DO_POSTGRES" == "y" ]]  && echo -e "    ${GREEN}•${RESET} PostgreSQL"
+  [[ "$DO_NGINX" == "y" ]]     && echo -e "    ${GREEN}•${RESET} nginx"
+  [[ "$DO_CERTBOT" == "y" ]]   && echo -e "    ${GREEN}•${RESET} Certbot"
+  [[ "$DO_REDIS" == "y" ]]     && echo -e "    ${GREEN}•${RESET} Redis"
+  [[ "$DO_DOCKER" == "y" ]]    && echo -e "    ${GREEN}•${RESET} Docker"
+  [[ "$DO_LOGROTATE" == "y" ]] && echo -e "    ${GREEN}•${RESET} Logrotate"
+
+  echo
+  echo -e "  ${YELLOW}${BOLD}Next steps:${RESET}"
+  local n=1
+  if [[ "$DO_SECURITY" == "y" ]]; then
+    echo -e "    ${DIM}${n}.${RESET} Test SSH as deploy user: ${CYAN}ssh ${DEPLOY_USER}@<server-ip>${RESET}"
+    ((n++))
+    echo -e "    ${DIM}${n}.${RESET} Add your SSH key if not copied: ${CYAN}ssh-copy-id ${DEPLOY_USER}@<server-ip>${RESET}"
+    ((n++))
+  fi
+  if [[ "$DO_POSTGRES" == "y" ]]; then
+    echo -e "    ${DIM}${n}.${RESET} Create a database: ${CYAN}./create-pg-database${RESET}"
+    ((n++))
+  fi
+  if [[ "$DO_NGINX" == "y" ]]; then
+    echo -e "    ${DIM}${n}.${RESET} Add nginx site configs to ${CYAN}/etc/nginx/sites-available/${RESET}"
+    ((n++))
+  fi
+  if [[ "$DO_CERTBOT" == "y" ]]; then
+    echo -e "    ${DIM}${n}.${RESET} Get SSL: ${CYAN}sudo certbot --nginx -d yourdomain.com${RESET}"
+    ((n++))
+  fi
+  if [[ "$DO_NODE" == "y" ]]; then
+    echo -e "    ${DIM}${n}.${RESET} Deploy app: ${CYAN}pm2 start app.js --name myapp${RESET}"
+    ((n++))
+  fi
+  echo
+}
+
+# ---------------------------
+# Banner
+# ---------------------------
+echo
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Production Server Setup${RESET}                     ${BOLD}${CYAN}║${RESET}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+# ---------------------------
+# Main
+# ---------------------------
+[[ "$SKIP_DETECT" != "y" ]] && show_environment
+choose_modules
+show_plan
+run_setup
+show_summary

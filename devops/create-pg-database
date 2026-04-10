@@ -1,0 +1,636 @@
+#!/bin/bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════
+#  create-pg-database — Interactive PostgreSQL database provisioner
+# ═══════════════════════════════════════════════════════════════
+
+# ---------------------------
+# Colors & formatting
+# ---------------------------
+BOLD='\033[1m'
+DIM='\033[2m'
+UNDERLINE='\033[4m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+RESET='\033[0m'
+
+# ---------------------------
+# Helpers
+# ---------------------------
+info()    { echo -e "${BLUE}ℹ${RESET}  $1"; }
+success() { echo -e "${GREEN}✔${RESET}  $1"; }
+warn()    { echo -e "${YELLOW}⚠${RESET}  $1"; }
+error()   { echo -e "${RED}✖${RESET}  $1"; }
+step()    { echo -e "\n${BOLD}${CYAN}[$1]${RESET} ${BOLD}$2${RESET}"; }
+divider() { echo -e "${DIM}$(printf '─%.0s' {1..60})${RESET}"; }
+
+ask() {
+  local prompt="$1" var="$2" default="${3:-}"
+  if [[ -n "$default" ]]; then
+    echo -en "  ${WHITE}${prompt}${RESET} ${DIM}(${default})${RESET}: "
+    read -r input
+    eval "$var='${input:-$default}'"
+  else
+    echo -en "  ${WHITE}${prompt}${RESET}: "
+    read -r input
+    eval "$var='$input'"
+  fi
+}
+
+ask_secret() {
+  local prompt="$1" var="$2"
+  echo -en "  ${WHITE}${prompt}${RESET}: "
+  read -rs input
+  echo
+  eval "$var='$input'"
+}
+
+ask_yesno() {
+  local prompt="$1" var="$2" default="${3:-n}"
+  local hint
+  if [[ "$default" == "y" ]]; then hint="Y/n"; else hint="y/N"; fi
+  echo -en "  ${WHITE}${prompt}${RESET} ${DIM}(${hint})${RESET}: "
+  read -r input
+  input="${input:-$default}"
+  if [[ "${input,,}" == "y" || "${input,,}" == "yes" ]]; then
+    eval "$var='y'"
+  else
+    eval "$var='n'"
+  fi
+}
+
+ask_choice() {
+  local prompt="$1" var="$2"
+  shift 2
+  local options=("$@")
+  echo -e "  ${WHITE}${prompt}${RESET}"
+  local i=1
+  for opt in "${options[@]}"; do
+    echo -e "    ${CYAN}${i})${RESET} ${opt}"
+    ((i++))
+  done
+  while true; do
+    echo -en "  ${WHITE}Choose [1-${#options[@]}]${RESET}: "
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
+      eval "$var='${options[$((choice-1))]}'"
+      break
+    fi
+    error "Invalid choice. Enter a number between 1 and ${#options[@]}."
+  done
+}
+
+confirm_or_abort() {
+  echo
+  ask_yesno "Proceed?" CONFIRM "n"
+  if [[ "$CONFIRM" != "y" ]]; then
+    echo
+    warn "Aborted."
+    exit 0
+  fi
+}
+
+show_help() {
+cat <<EOF
+Usage: $0 [options]
+
+Interactive PostgreSQL database & user provisioner.
+Run without flags for a guided wizard, or pass flags for scripted use.
+
+Options:
+  --db-name NAME           Database name
+  --user NAME              Database user
+  --password PASSWORD      Database user password
+  --orm ORM                prisma | typeorm | sequelize | django | generic
+  --owner                  Make user database owner (skip ORM grants)
+  --existing-user          Use an existing PostgreSQL role
+  --non-interactive        Skip wizard, require all values via flags
+  --help                   Show this help message
+
+Examples:
+  $0                                              # interactive wizard
+  $0 --db-name myapp --user myuser --orm prisma   # partial flags, prompts for rest
+  $0 --db-name myapp --user myuser --password secret --orm prisma --non-interactive
+EOF
+exit 0
+}
+
+# ---------------------------
+# PostgreSQL detection
+# ---------------------------
+pg_is_installed()  { command -v psql &>/dev/null; }
+pg_is_running()    { sudo -u postgres pg_isready &>/dev/null 2>&1; }
+
+pg_version() {
+  sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | head -1
+}
+
+pg_list_databases() {
+  sudo -u postgres psql -tAc \
+    "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;" 2>/dev/null
+}
+
+pg_list_roles() {
+  sudo -u postgres psql -tAc \
+    "SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg_%' ORDER BY rolname;" 2>/dev/null
+}
+
+pg_database_exists() {
+  sudo -u postgres psql -tAc \
+    "SELECT 1 FROM pg_database WHERE datname='$1';" 2>/dev/null | grep -q 1
+}
+
+pg_role_exists() {
+  sudo -u postgres psql -tAc \
+    "SELECT 1 FROM pg_roles WHERE rolname='$1';" 2>/dev/null | grep -q 1
+}
+
+pg_data_directory() {
+  sudo -u postgres psql -tAc "SHOW data_directory;" 2>/dev/null | xargs
+}
+
+pg_hba_file() {
+  sudo -u postgres psql -tAc "SHOW hba_file;" 2>/dev/null | xargs
+}
+
+pg_max_connections() {
+  sudo -u postgres psql -tAc "SHOW max_connections;" 2>/dev/null | xargs
+}
+
+pg_active_connections() {
+  sudo -u postgres psql -tAc \
+    "SELECT count(*) FROM pg_stat_activity WHERE state = 'active';" 2>/dev/null | xargs
+}
+
+pg_listen_addresses() {
+  sudo -u postgres psql -tAc "SHOW listen_addresses;" 2>/dev/null | xargs
+}
+
+pg_port() {
+  sudo -u postgres psql -tAc "SHOW port;" 2>/dev/null | xargs
+}
+
+# ---------------------------
+# Show current environment
+# ---------------------------
+show_pg_environment() {
+  step "1" "PostgreSQL Environment"
+  divider
+
+  if ! pg_is_installed; then
+    error "PostgreSQL client (psql) is not installed."
+    echo -e "  Install it with: ${CYAN}sudo apt install postgresql${RESET}"
+    exit 1
+  fi
+  success "psql found at $(command -v psql)"
+
+  if ! pg_is_running; then
+    error "PostgreSQL server is not running."
+    echo -e "  Start it with: ${CYAN}sudo systemctl start postgresql${RESET}"
+    exit 1
+  fi
+  success "Server is running"
+
+  local version port listen max_conn active_conn data_dir
+  version=$(pg_version)
+  port=$(pg_port)
+  listen=$(pg_listen_addresses)
+  max_conn=$(pg_max_connections)
+  active_conn=$(pg_active_connections)
+  data_dir=$(pg_data_directory)
+
+  echo
+  echo -e "  ${DIM}Version ........${RESET} ${WHITE}${version}${RESET}"
+  echo -e "  ${DIM}Port ...........${RESET} ${WHITE}${port}${RESET}"
+  echo -e "  ${DIM}Listen .........${RESET} ${WHITE}${listen}${RESET}"
+  echo -e "  ${DIM}Connections ....${RESET} ${WHITE}${active_conn} active / ${max_conn} max${RESET}"
+  echo -e "  ${DIM}Data dir .......${RESET} ${WHITE}${data_dir}${RESET}"
+
+  echo
+  echo -e "  ${UNDERLINE}Existing databases:${RESET}"
+  local dbs
+  dbs=$(pg_list_databases)
+  if [[ -z "$dbs" ]]; then
+    echo -e "    ${DIM}(none)${RESET}"
+  else
+    while IFS= read -r db; do
+      echo -e "    ${DIM}•${RESET} ${db}"
+    done <<< "$dbs"
+  fi
+
+  echo
+  echo -e "  ${UNDERLINE}Existing roles:${RESET}"
+  local roles
+  roles=$(pg_list_roles)
+  if [[ -z "$roles" ]]; then
+    echo -e "    ${DIM}(none)${RESET}"
+  else
+    while IFS= read -r role; do
+      echo -e "    ${DIM}•${RESET} ${role}"
+    done <<< "$roles"
+  fi
+}
+
+# ---------------------------
+# Collect input (interactive)
+# ---------------------------
+collect_input() {
+  step "2" "Database Configuration"
+  divider
+
+  # Database name
+  if [[ -z "$DB_NAME" ]]; then
+    ask "Database name" DB_NAME
+    while [[ -z "$DB_NAME" ]]; do
+      error "Database name cannot be empty."
+      ask "Database name" DB_NAME
+    done
+  else
+    info "Database name: ${WHITE}${DB_NAME}${RESET} (from flag)"
+  fi
+
+  if pg_database_exists "$DB_NAME"; then
+    warn "Database '${DB_NAME}' already exists — will skip creation."
+    DB_ALREADY_EXISTS="y"
+  else
+    DB_ALREADY_EXISTS="n"
+  fi
+
+  echo
+  step "3" "User Configuration"
+  divider
+
+  # Existing user?
+  if [[ "$USE_EXISTING_USER" != "y" ]]; then
+    ask_yesno "Use an existing PostgreSQL role?" USE_EXISTING_USER "n"
+  else
+    info "Using existing user (from flag)"
+  fi
+
+  # User name
+  if [[ "$USE_EXISTING_USER" == "y" ]]; then
+    local roles_list
+    roles_list=$(pg_list_roles)
+    if [[ -z "$DB_USER" ]]; then
+      echo -e "  ${DIM}Available roles:${RESET}"
+      while IFS= read -r r; do
+        echo -e "    ${DIM}•${RESET} ${r}"
+      done <<< "$roles_list"
+      echo
+      ask "Which role to use" DB_USER
+    else
+      info "User: ${WHITE}${DB_USER}${RESET} (from flag)"
+    fi
+
+    if ! pg_role_exists "$DB_USER"; then
+      error "Role '${DB_USER}' does not exist."
+      ask_yesno "Create it as a new role instead?" CREATE_ANYWAY "y"
+      if [[ "$CREATE_ANYWAY" == "y" ]]; then
+        USE_EXISTING_USER="n"
+      else
+        exit 1
+      fi
+    fi
+  else
+    if [[ -z "$DB_USER" ]]; then
+      ask "New username" DB_USER "${DB_NAME}_user"
+    else
+      info "User: ${WHITE}${DB_USER}${RESET} (from flag)"
+    fi
+  fi
+
+  while [[ -z "$DB_USER" ]]; do
+    error "Username cannot be empty."
+    ask "Username" DB_USER
+  done
+
+  if [[ "$USE_EXISTING_USER" != "y" ]] && pg_role_exists "$DB_USER"; then
+    warn "Role '${DB_USER}' already exists — will skip role creation."
+    ROLE_ALREADY_EXISTS="y"
+  else
+    ROLE_ALREADY_EXISTS="n"
+  fi
+
+  # Password
+  if [[ "$USE_EXISTING_USER" != "y" && "$ROLE_ALREADY_EXISTS" != "y" && -z "$DB_PASS" ]]; then
+    ask_secret "Password for '${DB_USER}'" DB_PASS
+    while [[ -z "$DB_PASS" ]]; do
+      error "Password cannot be empty."
+      ask_secret "Password for '${DB_USER}'" DB_PASS
+    done
+  fi
+
+  echo
+  step "4" "Permissions"
+  divider
+
+  # Owner?
+  if [[ "$MAKE_OWNER" != "y" ]]; then
+    ask_yesno "Make '${DB_USER}' the database owner? (full control)" MAKE_OWNER "n"
+  else
+    info "Will make user the database owner (from flag)"
+  fi
+
+  # ORM privileges
+  if [[ "$MAKE_OWNER" != "y" ]]; then
+    if [[ -z "$ORM" ]]; then
+      echo
+      echo -e "  ${WHITE}What privilege set should the user get?${RESET}"
+      echo -e "    ${CYAN}1)${RESET} prisma      ${DIM}— CRUD + schema migrations (CREATE on public)${RESET}"
+      echo -e "    ${CYAN}2)${RESET} typeorm      ${DIM}— CRUD + schema migrations (CREATE on public)${RESET}"
+      echo -e "    ${CYAN}3)${RESET} sequelize    ${DIM}— CRUD + schema migrations (CREATE on public)${RESET}"
+      echo -e "    ${CYAN}4)${RESET} django       ${DIM}— CRUD + schema migrations (CREATE on public)${RESET}"
+      echo -e "    ${CYAN}5)${RESET} generic      ${DIM}— CRUD only (no schema changes)${RESET}"
+      while true; do
+        echo -en "  ${WHITE}Choose [1-5]${RESET}: "
+        read -r orm_choice
+        case "$orm_choice" in
+          1) ORM="prisma";    break ;;
+          2) ORM="typeorm";   break ;;
+          3) ORM="sequelize"; break ;;
+          4) ORM="django";    break ;;
+          5) ORM="generic";   break ;;
+          *) error "Invalid choice." ;;
+        esac
+      done
+    else
+      info "Privilege set: ${WHITE}${ORM}${RESET} (from flag)"
+    fi
+  fi
+}
+
+# ---------------------------
+# Review plan
+# ---------------------------
+show_plan() {
+  echo
+  step "5" "Review"
+  divider
+  echo
+  echo -e "  ${BOLD}The following actions will be performed:${RESET}"
+  echo
+
+  local action_num=1
+
+  if [[ "$USE_EXISTING_USER" != "y" && "$ROLE_ALREADY_EXISTS" != "y" ]]; then
+    echo -e "  ${GREEN}${action_num}.${RESET} Create role ${WHITE}${DB_USER}${RESET} with login + password"
+    ((action_num++))
+  fi
+
+  if [[ "$DB_ALREADY_EXISTS" != "y" ]]; then
+    echo -e "  ${GREEN}${action_num}.${RESET} Create database ${WHITE}${DB_NAME}${RESET}"
+    ((action_num++))
+  fi
+
+  if [[ "$MAKE_OWNER" == "y" ]]; then
+    echo -e "  ${GREEN}${action_num}.${RESET} Set ${WHITE}${DB_USER}${RESET} as owner of ${WHITE}${DB_NAME}${RESET}"
+  else
+    echo -e "  ${GREEN}${action_num}.${RESET} Grant ${WHITE}${ORM}${RESET} privileges to ${WHITE}${DB_USER}${RESET} on ${WHITE}${DB_NAME}${RESET}"
+    ((action_num++))
+    echo -e "    ${DIM}├ CONNECT on database${RESET}"
+    if [[ "$ORM" == "generic" ]]; then
+      echo -e "    ${DIM}├ USAGE on schema public${RESET}"
+      echo -e "    ${DIM}├ CRUD on all tables${RESET}"
+      echo -e "    ${DIM}├ USAGE, SELECT on sequences${RESET}"
+      echo -e "    ${DIM}└ Default CRUD privileges on future tables${RESET}"
+    else
+      echo -e "    ${DIM}├ USAGE, CREATE on schema public${RESET}"
+      echo -e "    ${DIM}├ CRUD on all tables${RESET}"
+      echo -e "    ${DIM}├ USAGE, SELECT, UPDATE on sequences${RESET}"
+      echo -e "    ${DIM}├ Default CRUD privileges on future tables${RESET}"
+      echo -e "    ${DIM}└ Default sequence privileges on future sequences${RESET}"
+    fi
+  fi
+
+  echo
+  echo -e "  ${DIM}Connection string:${RESET}"
+  local pass_display
+  if [[ -n "${DB_PASS:-}" ]]; then
+    pass_display="********"
+  else
+    pass_display="<existing>"
+  fi
+  local port
+  port=$(pg_port 2>/dev/null || echo "5432")
+  echo -e "  ${CYAN}postgresql://${DB_USER}:${pass_display}@localhost:${port}/${DB_NAME}${RESET}"
+
+  confirm_or_abort
+}
+
+# ---------------------------
+# Execute
+# ---------------------------
+execute() {
+  echo
+  step "6" "Executing"
+  divider
+
+  # Create role
+  if [[ "$USE_EXISTING_USER" != "y" && "${ROLE_ALREADY_EXISTS:-n}" != "y" ]]; then
+    echo -en "  Creating role '${DB_USER}' ... "
+    sudo -u postgres psql -q <<EOF
+DO \$\$
+BEGIN
+  IF NOT EXISTS (
+    SELECT FROM pg_roles WHERE rolname = '${DB_USER}'
+  ) THEN
+    CREATE ROLE "${DB_USER}" LOGIN PASSWORD '${DB_PASS}';
+  END IF;
+END
+\$\$;
+EOF
+    echo -e "${GREEN}done${RESET}"
+  fi
+
+  # Create database
+  if [[ "${DB_ALREADY_EXISTS:-n}" != "y" ]]; then
+    echo -en "  Creating database '${DB_NAME}' ... "
+    sudo -u postgres psql -q -c "CREATE DATABASE \"${DB_NAME}\";"
+    echo -e "${GREEN}done${RESET}"
+  fi
+
+  # Ownership
+  if [[ "$MAKE_OWNER" == "y" ]]; then
+    echo -en "  Setting '${DB_USER}' as owner ... "
+    sudo -u postgres psql -q -c \
+      "ALTER DATABASE \"${DB_NAME}\" OWNER TO \"${DB_USER}\";"
+    echo -e "${GREEN}done${RESET}"
+  else
+    # Grant connect
+    echo -en "  Granting CONNECT ... "
+    sudo -u postgres psql -q -c \
+      "GRANT CONNECT ON DATABASE \"${DB_NAME}\" TO \"${DB_USER}\";"
+    echo -e "${GREEN}done${RESET}"
+
+    # Grant schema privileges
+    echo -en "  Granting ${ORM} privileges ... "
+    case "$ORM" in
+      prisma|typeorm|sequelize|django)
+        sudo -u postgres psql -q -d "${DB_NAME}" <<EOF
+GRANT USAGE, CREATE ON SCHEMA public TO "${DB_USER}";
+
+GRANT SELECT, INSERT, UPDATE, DELETE
+ON ALL TABLES IN SCHEMA public TO "${DB_USER}";
+
+GRANT USAGE, SELECT, UPDATE
+ON ALL SEQUENCES IN SCHEMA public TO "${DB_USER}";
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "${DB_USER}";
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO "${DB_USER}";
+EOF
+        ;;
+      generic)
+        sudo -u postgres psql -q -d "${DB_NAME}" <<EOF
+GRANT USAGE ON SCHEMA public TO "${DB_USER}";
+
+GRANT SELECT, INSERT, UPDATE, DELETE
+ON ALL TABLES IN SCHEMA public TO "${DB_USER}";
+
+GRANT USAGE, SELECT
+ON ALL SEQUENCES IN SCHEMA public TO "${DB_USER}";
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "${DB_USER}";
+EOF
+        ;;
+    esac
+    echo -e "${GREEN}done${RESET}"
+  fi
+}
+
+# ---------------------------
+# Summary
+# ---------------------------
+show_summary() {
+  local port
+  port=$(pg_port 2>/dev/null || echo "5432")
+
+  echo
+  divider
+  echo
+  echo -e "  ${GREEN}${BOLD}✔ All done!${RESET}"
+  echo
+  echo -e "  ${DIM}Database .......${RESET} ${WHITE}${DB_NAME}${RESET}"
+  echo -e "  ${DIM}User ...........${RESET} ${WHITE}${DB_USER}${RESET}"
+  if [[ "$MAKE_OWNER" == "y" ]]; then
+    echo -e "  ${DIM}Role ...........${RESET} ${WHITE}owner${RESET}"
+  else
+    echo -e "  ${DIM}Privileges .....${RESET} ${WHITE}${ORM}${RESET}"
+  fi
+  echo
+  echo -e "  ${DIM}Connection string:${RESET}"
+  echo -e "  ${CYAN}postgresql://${DB_USER}:<password>@localhost:${port}/${DB_NAME}${RESET}"
+
+  if [[ "${ORM:-}" == "prisma" ]]; then
+    echo
+    echo -e "  ${DIM}Prisma .env:${RESET}"
+    echo -e "  ${CYAN}DATABASE_URL=\"postgresql://${DB_USER}:<password>@localhost:${port}/${DB_NAME}?schema=public\"${RESET}"
+  elif [[ "${ORM:-}" == "django" ]]; then
+    echo
+    echo -e "  ${DIM}Django settings.py:${RESET}"
+    echo -e "  ${CYAN}DATABASES = {"
+    echo -e "      'default': {"
+    echo -e "          'ENGINE': 'django.db.backends.postgresql',"
+    echo -e "          'NAME': '${DB_NAME}',"
+    echo -e "          'USER': '${DB_USER}',"
+    echo -e "          'PASSWORD': '<password>',"
+    echo -e "          'HOST': 'localhost',"
+    echo -e "          'PORT': '${port}',"
+    echo -e "      }"
+    echo -e "  }${RESET}"
+  elif [[ "${ORM:-}" == "typeorm" ]]; then
+    echo
+    echo -e "  ${DIM}TypeORM .env:${RESET}"
+    echo -e "  ${CYAN}DB_HOST=localhost"
+    echo -e "  DB_PORT=${port}"
+    echo -e "  DB_USERNAME=${DB_USER}"
+    echo -e "  DB_PASSWORD=<password>"
+    echo -e "  DB_DATABASE=${DB_NAME}${RESET}"
+  elif [[ "${ORM:-}" == "sequelize" ]]; then
+    echo
+    echo -e "  ${DIM}Sequelize config:${RESET}"
+    echo -e "  ${CYAN}{ dialect: 'postgres', host: 'localhost', port: ${port},"
+    echo -e "    username: '${DB_USER}', password: '<password>', database: '${DB_NAME}' }${RESET}"
+  fi
+  echo
+}
+
+# ---------------------------
+# Defaults
+# ---------------------------
+DB_NAME=""
+DB_USER=""
+DB_PASS=""
+ORM=""
+MAKE_OWNER="n"
+USE_EXISTING_USER="n"
+NON_INTERACTIVE="n"
+DB_ALREADY_EXISTS="n"
+ROLE_ALREADY_EXISTS="n"
+
+# ---------------------------
+# Parse flags
+# ---------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --db-name)
+      DB_NAME="$2"; shift 2 ;;
+    --user)
+      DB_USER="$2"; shift 2 ;;
+    --password)
+      DB_PASS="$2"; shift 2 ;;
+    --orm)
+      ORM="$2"; shift 2 ;;
+    --owner)
+      MAKE_OWNER="y"; shift ;;
+    --existing-user)
+      USE_EXISTING_USER="y"; shift ;;
+    --non-interactive)
+      NON_INTERACTIVE="y"; shift ;;
+    --help|-h)
+      show_help ;;
+    *)
+      error "Unknown option: $1"
+      echo
+      show_help ;;
+  esac
+done
+
+# ---------------------------
+# Non-interactive validation
+# ---------------------------
+if [[ "$NON_INTERACTIVE" == "y" ]]; then
+  [[ -z "$DB_NAME" ]] && { error "--db-name is required in non-interactive mode."; exit 1; }
+  [[ -z "$DB_USER" ]] && { error "--user is required in non-interactive mode."; exit 1; }
+  [[ "$USE_EXISTING_USER" != "y" && -z "$DB_PASS" ]] && {
+    error "--password is required in non-interactive mode (unless --existing-user)."; exit 1;
+  }
+  [[ "$MAKE_OWNER" != "y" && -z "$ORM" ]] && {
+    error "--orm is required in non-interactive mode (unless --owner)."; exit 1;
+  }
+fi
+
+# ---------------------------
+# Banner
+# ---------------------------
+echo
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}PostgreSQL Database Provisioner${RESET}             ${BOLD}${CYAN}║${RESET}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+# ---------------------------
+# Main flow
+# ---------------------------
+show_pg_environment
+collect_input
+show_plan
+execute
+show_summary

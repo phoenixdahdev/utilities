@@ -1,0 +1,648 @@
+#!/bin/bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════
+#  pc-setup — Interactive dev environment provisioner
+# ═══════════════════════════════════════════════════════════════
+
+# ---------------------------
+# Colors & formatting
+# ---------------------------
+BOLD='\033[1m'
+DIM='\033[2m'
+UNDERLINE='\033[4m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+RESET='\033[0m'
+
+info()    { echo -e "${BLUE}ℹ${RESET}  $1"; }
+success() { echo -e "${GREEN}✔${RESET}  $1"; }
+warn()    { echo -e "${YELLOW}⚠${RESET}  $1"; }
+error()   { echo -e "${RED}✖${RESET}  $1"; }
+step()    { echo -e "\n${BOLD}${CYAN}[$1]${RESET} ${BOLD}$2${RESET}"; }
+divider() { echo -e "${DIM}$(printf '─%.0s' {1..60})${RESET}"; }
+
+ask_yesno() {
+  local prompt="$1" var="$2" default="${3:-n}"
+  local hint
+  if [[ "$default" == "y" ]]; then hint="Y/n"; else hint="y/N"; fi
+  echo -en "  ${WHITE}${prompt}${RESET} ${DIM}(${hint})${RESET}: "
+  read -r input
+  input="${input:-$default}"
+  if [[ "${input,,}" == "y" || "${input,,}" == "yes" ]]; then
+    eval "$var='y'"
+  else
+    eval "$var='n'"
+  fi
+}
+
+confirm_or_abort() {
+  echo
+  ask_yesno "Proceed with installation?" CONFIRM "n"
+  if [[ "$CONFIRM" != "y" ]]; then
+    echo
+    warn "Aborted."
+    exit 0
+  fi
+}
+
+# ---------------------------
+# Detection helpers
+# ---------------------------
+has_cmd()  { command -v "$1" &>/dev/null; }
+has_snap() { snap list "$1" &>/dev/null 2>&1; }
+
+detect_status() {
+  local name="$1" check="$2"
+  if eval "$check"; then
+    echo -e "    ${GREEN}✔${RESET} ${name}"
+    return 0
+  else
+    echo -e "    ${RED}✖${RESET} ${name}"
+    return 1
+  fi
+}
+
+# ---------------------------
+# Bundled .zshrc
+# ---------------------------
+ZSHRC_CONTENT='# Path to your oh-my-zsh installation.
+export ZSH=~/.oh-my-zsh
+ZSH_THEME="robbyrussell"
+plugins=(
+  git
+  zsh-syntax-highlighting
+  zsh-autosuggestions
+)
+source $ZSH/oh-my-zsh.sh
+export PATH=$HOME/.local/bin:$PATH
+# bun completions
+[ -s "$HOME/.bun/_bun" ] && source "$HOME/.bun/_bun"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+
+export NVM_DIR="$HOME/.config/nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+# pnpm
+export PNPM_HOME="$HOME/.local/share/pnpm"
+case ":$PATH:" in
+  *":$PNPM_HOME:"*) ;;
+  *) export PATH="$PNPM_HOME:$PATH" ;;
+esac
+# pnpm end'
+
+# ---------------------------
+# Show help
+# ---------------------------
+show_help() {
+cat <<EOF
+Usage: $0 [options]
+
+Interactive dev environment setup. Run without flags for guided wizard.
+
+Options:
+  --all                Install everything (non-interactive)
+  --skip-detect        Skip environment detection display
+  --help               Show this help message
+
+Components installed:
+  • zsh + Oh My Zsh + plugins (syntax-highlighting, autosuggestions)
+  • .zshrc (bundled config with nvm, pnpm, bun paths)
+  • Ghostty terminal (via snap)
+  • NVM + Node.js LTS
+  • pnpm
+  • Bun
+  • Python3 + pip + venv
+  • PostgreSQL (latest from PGDG)
+  • Git (latest)
+  • curl, wget, build-essential
+  • Optional: nginx, certbot, Docker, Redis, UFW
+EOF
+exit 0
+}
+
+# ---------------------------
+# Detect current environment
+# ---------------------------
+show_environment() {
+  step "1" "Current Environment"
+  divider
+
+  local os_name kernel arch mem disk cpus
+  os_name=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "Unknown")
+  kernel=$(uname -r)
+  arch=$(uname -m)
+  mem=$(free -h | awk '/Mem:/{print $2}')
+  disk=$(df -h / | awk 'NR==2{print $4 " free / " $2 " total"}')
+  cpus=$(nproc)
+
+  echo -e "  ${DIM}OS .............${RESET} ${WHITE}${os_name}${RESET}"
+  echo -e "  ${DIM}Kernel .........${RESET} ${WHITE}${kernel} (${arch})${RESET}"
+  echo -e "  ${DIM}CPU ............${RESET} ${WHITE}${cpus} cores${RESET}"
+  echo -e "  ${DIM}Memory .........${RESET} ${WHITE}${mem}${RESET}"
+  echo -e "  ${DIM}Disk ...........${RESET} ${WHITE}${disk}${RESET}"
+
+  echo
+  echo -e "  ${UNDERLINE}Core tools:${RESET}"
+  detect_status "zsh $(zsh --version 2>/dev/null | awk '{print $2}' || true)" "has_cmd zsh" || true
+  detect_status "Oh My Zsh" "[ -d \"\$HOME/.oh-my-zsh\" ]" || true
+  detect_status "Ghostty $(ghostty --version 2>/dev/null | head -1 | awk '{print $2}' || true)" "has_cmd ghostty" || true
+  detect_status "Git $(git --version 2>/dev/null | awk '{print $3}' || true)" "has_cmd git" || true
+  detect_status "curl" "has_cmd curl" || true
+
+  echo
+  echo -e "  ${UNDERLINE}Languages & runtimes:${RESET}"
+  detect_status "NVM" "[ -d \"\${NVM_DIR:-\$HOME/.config/nvm}\" ] && [ -s \"\${NVM_DIR:-\$HOME/.config/nvm}/nvm.sh\" ]" || true
+  detect_status "Node.js $(node --version 2>/dev/null || true)" "has_cmd node" || true
+  detect_status "npm $(npm --version 2>/dev/null || true)" "has_cmd npm" || true
+  detect_status "pnpm $(pnpm --version 2>/dev/null || true)" "has_cmd pnpm" || true
+  detect_status "Bun $(bun --version 2>/dev/null || true)" "has_cmd bun" || true
+  detect_status "Python3 $(python3 --version 2>/dev/null | awk '{print $2}' || true)" "has_cmd python3" || true
+  detect_status "pip3" "has_cmd pip3" || true
+
+  echo
+  echo -e "  ${UNDERLINE}Services:${RESET}"
+  detect_status "PostgreSQL (psql $(psql --version 2>/dev/null | awk '{print $3}' || true))" "has_cmd psql" || true
+  detect_status "nginx" "has_cmd nginx" || true
+  detect_status "Docker" "has_cmd docker" || true
+  detect_status "Redis" "has_cmd redis-cli" || true
+}
+
+# ---------------------------
+# Choose components
+# ---------------------------
+INSTALL_ESSENTIALS="y"
+INSTALL_ZSH="n"
+INSTALL_OHMYZSH="n"
+INSTALL_ZSHRC="n"
+INSTALL_GHOSTTY="n"
+INSTALL_NVM="n"
+INSTALL_PNPM="n"
+INSTALL_BUN="n"
+INSTALL_PYTHON="n"
+INSTALL_POSTGRES="n"
+INSTALL_NGINX="n"
+INSTALL_CERTBOT="n"
+INSTALL_DOCKER="n"
+INSTALL_REDIS="n"
+INSTALL_UFW="n"
+INSTALL_ALL="n"
+SKIP_DETECT="n"
+
+choose_components() {
+  step "2" "What to install"
+  divider
+
+  if [[ "$INSTALL_ALL" == "y" ]]; then
+    INSTALL_ZSH="y" INSTALL_OHMYZSH="y" INSTALL_ZSHRC="y" INSTALL_GHOSTTY="y"
+    INSTALL_NVM="y" INSTALL_PNPM="y" INSTALL_BUN="y" INSTALL_PYTHON="y"
+    INSTALL_POSTGRES="y" INSTALL_NGINX="y" INSTALL_CERTBOT="y"
+    INSTALL_DOCKER="y" INSTALL_REDIS="y" INSTALL_UFW="y"
+    info "Installing all components (--all)"
+    return
+  fi
+
+  echo -e "  ${DIM}Answer y/n for each component.${RESET}"
+  echo -e "  ${DIM}Already-installed items will be skipped safely.${RESET}"
+  echo
+
+  echo -e "  ${BOLD}── Core ──${RESET}"
+  ask_yesno "Zsh shell" INSTALL_ZSH "y"
+  ask_yesno "Oh My Zsh + plugins (syntax-highlighting, autosuggestions)" INSTALL_OHMYZSH "y"
+  ask_yesno "Restore .zshrc (bundled config)" INSTALL_ZSHRC "y"
+  ask_yesno "Ghostty terminal" INSTALL_GHOSTTY "y"
+
+  echo
+  echo -e "  ${BOLD}── Languages & tools ──${RESET}"
+  ask_yesno "NVM + Node.js LTS" INSTALL_NVM "y"
+  ask_yesno "pnpm" INSTALL_PNPM "y"
+  ask_yesno "Bun" INSTALL_BUN "y"
+  ask_yesno "Python3 + pip + venv" INSTALL_PYTHON "y"
+
+  echo
+  echo -e "  ${BOLD}── Services ──${RESET}"
+  ask_yesno "PostgreSQL (latest from PGDG)" INSTALL_POSTGRES "y"
+  ask_yesno "nginx" INSTALL_NGINX "n"
+  ask_yesno "certbot (Let's Encrypt)" INSTALL_CERTBOT "n"
+  ask_yesno "Docker" INSTALL_DOCKER "n"
+  ask_yesno "Redis" INSTALL_REDIS "n"
+  ask_yesno "UFW firewall (configure SSH + HTTP/S)" INSTALL_UFW "n"
+}
+
+# ---------------------------
+# Review plan
+# ---------------------------
+show_plan() {
+  step "3" "Review"
+  divider
+  echo
+  echo -e "  ${BOLD}Will install:${RESET}"
+
+  local count=0
+  [[ "$INSTALL_ESSENTIALS" == "y" ]] && { echo -e "    ${GREEN}•${RESET} System essentials (git, curl, wget, build-essential)"; ((count++)); }
+  [[ "$INSTALL_ZSH" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} Zsh"; ((count++)); }
+  [[ "$INSTALL_OHMYZSH" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Oh My Zsh + zsh-syntax-highlighting + zsh-autosuggestions"; ((count++)); }
+  [[ "$INSTALL_ZSHRC" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} .zshrc (bundled config)"; ((count++)); }
+  [[ "$INSTALL_GHOSTTY" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Ghostty terminal (snap)"; ((count++)); }
+  [[ "$INSTALL_NVM" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} NVM + Node.js LTS"; ((count++)); }
+  [[ "$INSTALL_PNPM" == "y" ]]       && { echo -e "    ${GREEN}•${RESET} pnpm"; ((count++)); }
+  [[ "$INSTALL_BUN" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} Bun"; ((count++)); }
+  [[ "$INSTALL_PYTHON" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Python3 + pip + venv"; ((count++)); }
+  [[ "$INSTALL_POSTGRES" == "y" ]]   && { echo -e "    ${GREEN}•${RESET} PostgreSQL (PGDG)"; ((count++)); }
+  [[ "$INSTALL_NGINX" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} nginx"; ((count++)); }
+  [[ "$INSTALL_CERTBOT" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} certbot + python3-certbot-nginx"; ((count++)); }
+  [[ "$INSTALL_DOCKER" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Docker Engine"; ((count++)); }
+  [[ "$INSTALL_REDIS" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} Redis"; ((count++)); }
+  [[ "$INSTALL_UFW" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} UFW (allow SSH, HTTP, HTTPS)"; ((count++)); }
+
+  if [[ "$count" -eq 0 ]]; then
+    warn "Nothing selected."
+    exit 0
+  fi
+
+  echo -e "\n  ${DIM}${count} component(s) selected.${RESET}"
+
+  confirm_or_abort
+}
+
+# ---------------------------
+# Installers
+# ---------------------------
+install_essentials() {
+  info "Installing system essentials ..."
+  sudo apt update -qq
+  sudo apt install -y -qq git curl wget build-essential software-properties-common \
+    ca-certificates gnupg lsb-release unzip >/dev/null
+  success "Essentials installed"
+}
+
+install_zsh() {
+  if has_cmd zsh; then
+    success "Zsh already installed"
+  else
+    info "Installing zsh ..."
+    sudo apt install -y -qq zsh >/dev/null
+    success "Zsh installed"
+  fi
+
+  # Set as default shell if not already
+  local current_shell
+  current_shell=$(getent passwd "$USER" | cut -d: -f7)
+  if [[ "$current_shell" != *"zsh"* ]]; then
+    info "Setting zsh as default shell ..."
+    sudo chsh -s "$(which zsh)" "$USER"
+    success "Default shell set to zsh"
+  else
+    success "Zsh is already default shell"
+  fi
+}
+
+install_ohmyzsh() {
+  if [[ -d "$HOME/.oh-my-zsh" ]]; then
+    success "Oh My Zsh already installed"
+  else
+    info "Installing Oh My Zsh ..."
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+    success "Oh My Zsh installed"
+  fi
+
+  # zsh-syntax-highlighting
+  local plugin_dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins"
+  if [[ -d "$plugin_dir/zsh-syntax-highlighting" ]]; then
+    success "zsh-syntax-highlighting already installed"
+  else
+    info "Installing zsh-syntax-highlighting ..."
+    git clone --quiet https://github.com/zsh-users/zsh-syntax-highlighting.git \
+      "$plugin_dir/zsh-syntax-highlighting"
+    success "zsh-syntax-highlighting installed"
+  fi
+
+  # zsh-autosuggestions
+  if [[ -d "$plugin_dir/zsh-autosuggestions" ]]; then
+    success "zsh-autosuggestions already installed"
+  else
+    info "Installing zsh-autosuggestions ..."
+    git clone --quiet https://github.com/zsh-users/zsh-autosuggestions.git \
+      "$plugin_dir/zsh-autosuggestions"
+    success "zsh-autosuggestions installed"
+  fi
+}
+
+install_zshrc() {
+  if [[ -f "$HOME/.zshrc" ]]; then
+    local backup="$HOME/.zshrc.backup.$(date +%Y%m%d%H%M%S)"
+    warn "Existing .zshrc backed up to ${backup}"
+    cp "$HOME/.zshrc" "$backup"
+  fi
+  echo "$ZSHRC_CONTENT" > "$HOME/.zshrc"
+  success ".zshrc written"
+}
+
+install_ghostty() {
+  if has_cmd ghostty; then
+    success "Ghostty already installed ($(ghostty --version 2>/dev/null | head -1))"
+  else
+    info "Installing Ghostty via snap ..."
+    sudo snap install ghostty --classic
+    success "Ghostty installed"
+  fi
+
+  # Ensure config directory exists
+  mkdir -p "$HOME/.config/ghostty"
+  success "Ghostty config dir ready at ~/.config/ghostty/"
+}
+
+install_nvm() {
+  local nvm_dir="${NVM_DIR:-$HOME/.config/nvm}"
+
+  if [[ -s "$nvm_dir/nvm.sh" ]]; then
+    success "NVM already installed"
+  else
+    info "Installing NVM ..."
+    export NVM_DIR="$nvm_dir"
+    mkdir -p "$NVM_DIR"
+    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+    success "NVM installed at $nvm_dir"
+  fi
+
+  # Load nvm for this session
+  export NVM_DIR="$nvm_dir"
+  # shellcheck disable=SC1091
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+  if has_cmd node; then
+    success "Node.js already installed ($(node --version))"
+  else
+    info "Installing Node.js LTS ..."
+    nvm install --lts
+    nvm use --lts
+    nvm alias default lts/*
+    success "Node.js LTS installed ($(node --version))"
+  fi
+}
+
+install_pnpm() {
+  if has_cmd pnpm; then
+    success "pnpm already installed ($(pnpm --version))"
+  else
+    info "Installing pnpm ..."
+    curl -fsSL https://get.pnpm.io/install.sh | sh -
+    success "pnpm installed"
+  fi
+}
+
+install_bun() {
+  if has_cmd bun; then
+    success "Bun already installed ($(bun --version))"
+  else
+    info "Installing Bun ..."
+    curl -fsSL https://bun.sh/install | bash
+    success "Bun installed"
+  fi
+}
+
+install_python() {
+  if has_cmd python3; then
+    success "Python3 already installed ($(python3 --version))"
+  else
+    info "Installing Python3 ..."
+    sudo apt install -y -qq python3 >/dev/null
+    success "Python3 installed"
+  fi
+
+  if has_cmd pip3; then
+    success "pip3 already installed"
+  else
+    info "Installing pip3 ..."
+    sudo apt install -y -qq python3-pip >/dev/null
+    success "pip3 installed"
+  fi
+
+  if python3 -c "import venv" 2>/dev/null; then
+    success "python3-venv already available"
+  else
+    info "Installing python3-venv ..."
+    sudo apt install -y -qq python3-venv >/dev/null
+    success "python3-venv installed"
+  fi
+}
+
+install_postgres() {
+  if has_cmd psql; then
+    success "PostgreSQL already installed (psql $(psql --version | awk '{print $3}'))"
+  else
+    info "Installing PostgreSQL from PGDG ..."
+    sudo apt install -y -qq curl ca-certificates >/dev/null
+    sudo install -d /usr/share/postgresql-common/pgdg
+    sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
+      sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+    sudo apt update -qq
+    sudo apt install -y -qq postgresql >/dev/null
+    success "PostgreSQL installed"
+  fi
+
+  # Ensure service is running
+  if sudo systemctl is-active postgresql &>/dev/null; then
+    success "PostgreSQL service is running"
+  else
+    info "Starting PostgreSQL service ..."
+    sudo systemctl start postgresql
+    sudo systemctl enable postgresql
+    success "PostgreSQL started and enabled"
+  fi
+}
+
+install_nginx() {
+  if has_cmd nginx; then
+    success "nginx already installed"
+  else
+    info "Installing nginx ..."
+    sudo apt install -y -qq nginx >/dev/null
+    success "nginx installed"
+  fi
+  sudo systemctl start nginx 2>/dev/null || true
+  sudo systemctl enable nginx 2>/dev/null || true
+  success "nginx is running"
+}
+
+install_certbot() {
+  if has_cmd certbot; then
+    success "certbot already installed"
+  else
+    info "Installing certbot ..."
+    sudo apt install -y -qq certbot python3-certbot-nginx >/dev/null
+    success "certbot installed"
+  fi
+}
+
+install_docker() {
+  if has_cmd docker; then
+    success "Docker already installed ($(docker --version))"
+  else
+    info "Installing Docker Engine ..."
+    # Add Docker GPG key
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+      sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Add Docker repo
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+      sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+    sudo apt update -qq
+    sudo apt install -y -qq docker-ce docker-ce-cli containerd.io \
+      docker-buildx-plugin docker-compose-plugin >/dev/null
+    success "Docker installed"
+  fi
+
+  # Add user to docker group
+  if groups "$USER" | grep -q docker; then
+    success "User already in docker group"
+  else
+    info "Adding $USER to docker group ..."
+    sudo usermod -aG docker "$USER"
+    success "Added to docker group (log out and back in to take effect)"
+  fi
+
+  sudo systemctl start docker 2>/dev/null || true
+  sudo systemctl enable docker 2>/dev/null || true
+  success "Docker is running"
+}
+
+install_redis() {
+  if has_cmd redis-cli; then
+    success "Redis already installed"
+  else
+    info "Installing Redis ..."
+    sudo apt install -y -qq redis-server >/dev/null
+    success "Redis installed"
+  fi
+  sudo systemctl start redis-server 2>/dev/null || true
+  sudo systemctl enable redis-server 2>/dev/null || true
+  success "Redis is running"
+}
+
+install_ufw() {
+  if ! has_cmd ufw; then
+    info "Installing UFW ..."
+    sudo apt install -y -qq ufw >/dev/null
+  fi
+  info "Configuring UFW ..."
+  sudo ufw default deny incoming >/dev/null
+  sudo ufw default allow outgoing >/dev/null
+  sudo ufw allow ssh >/dev/null
+  sudo ufw allow http >/dev/null
+  sudo ufw allow https >/dev/null
+  sudo ufw --force enable >/dev/null
+  success "UFW enabled (SSH + HTTP + HTTPS allowed)"
+}
+
+# ---------------------------
+# Execute all
+# ---------------------------
+run_installs() {
+  step "4" "Installing"
+  divider
+
+  [[ "$INSTALL_ESSENTIALS" == "y" ]] && install_essentials
+  [[ "$INSTALL_ZSH" == "y" ]]        && install_zsh
+  [[ "$INSTALL_OHMYZSH" == "y" ]]    && install_ohmyzsh
+  [[ "$INSTALL_ZSHRC" == "y" ]]      && install_zshrc
+  [[ "$INSTALL_GHOSTTY" == "y" ]]    && install_ghostty
+  [[ "$INSTALL_NVM" == "y" ]]        && install_nvm
+  [[ "$INSTALL_PNPM" == "y" ]]       && install_pnpm
+  [[ "$INSTALL_BUN" == "y" ]]        && install_bun
+  [[ "$INSTALL_PYTHON" == "y" ]]     && install_python
+  [[ "$INSTALL_POSTGRES" == "y" ]]   && install_postgres
+  [[ "$INSTALL_NGINX" == "y" ]]      && install_nginx
+  [[ "$INSTALL_CERTBOT" == "y" ]]    && install_certbot
+  [[ "$INSTALL_DOCKER" == "y" ]]     && install_docker
+  [[ "$INSTALL_REDIS" == "y" ]]      && install_redis
+  [[ "$INSTALL_UFW" == "y" ]]        && install_ufw
+}
+
+# ---------------------------
+# Summary
+# ---------------------------
+show_summary() {
+  echo
+  divider
+  echo
+  echo -e "  ${GREEN}${BOLD}✔ Setup complete!${RESET}"
+  echo
+  echo -e "  ${DIM}Installed:${RESET}"
+
+  [[ "$INSTALL_ZSH" == "y" ]]        && echo -e "    ${GREEN}•${RESET} zsh (default shell)"
+  [[ "$INSTALL_OHMYZSH" == "y" ]]    && echo -e "    ${GREEN}•${RESET} Oh My Zsh + plugins"
+  [[ "$INSTALL_ZSHRC" == "y" ]]      && echo -e "    ${GREEN}•${RESET} .zshrc restored"
+  [[ "$INSTALL_GHOSTTY" == "y" ]]    && echo -e "    ${GREEN}•${RESET} Ghostty terminal"
+  [[ "$INSTALL_NVM" == "y" ]]        && echo -e "    ${GREEN}•${RESET} NVM + Node.js"
+  [[ "$INSTALL_PNPM" == "y" ]]       && echo -e "    ${GREEN}•${RESET} pnpm"
+  [[ "$INSTALL_BUN" == "y" ]]        && echo -e "    ${GREEN}•${RESET} Bun"
+  [[ "$INSTALL_PYTHON" == "y" ]]     && echo -e "    ${GREEN}•${RESET} Python3 + pip + venv"
+  [[ "$INSTALL_POSTGRES" == "y" ]]   && echo -e "    ${GREEN}•${RESET} PostgreSQL"
+  [[ "$INSTALL_NGINX" == "y" ]]      && echo -e "    ${GREEN}•${RESET} nginx"
+  [[ "$INSTALL_CERTBOT" == "y" ]]    && echo -e "    ${GREEN}•${RESET} certbot"
+  [[ "$INSTALL_DOCKER" == "y" ]]     && echo -e "    ${GREEN}•${RESET} Docker"
+  [[ "$INSTALL_REDIS" == "y" ]]      && echo -e "    ${GREEN}•${RESET} Redis"
+  [[ "$INSTALL_UFW" == "y" ]]        && echo -e "    ${GREEN}•${RESET} UFW"
+
+  echo
+  echo -e "  ${YELLOW}Next steps:${RESET}"
+  echo -e "    ${DIM}1.${RESET} Log out and back in (for shell + group changes)"
+  [[ "$INSTALL_POSTGRES" == "y" ]] && \
+    echo -e "    ${DIM}2.${RESET} Run ${CYAN}./create-pg-database${RESET} to set up a database"
+  [[ "$INSTALL_GHOSTTY" == "y" ]] && \
+    echo -e "    ${DIM}3.${RESET} Configure Ghostty at ${CYAN}~/.config/ghostty/config${RESET}"
+  [[ "$INSTALL_CERTBOT" == "y" ]] && \
+    echo -e "    ${DIM}4.${RESET} Run ${CYAN}sudo certbot --nginx -d yourdomain.com${RESET} for SSL"
+  echo
+}
+
+# ---------------------------
+# Parse flags
+# ---------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)
+      INSTALL_ALL="y"; shift ;;
+    --skip-detect)
+      SKIP_DETECT="y"; shift ;;
+    --help|-h)
+      show_help ;;
+    *)
+      error "Unknown option: $1"
+      echo
+      show_help ;;
+  esac
+done
+
+# ---------------------------
+# Banner
+# ---------------------------
+echo
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Dev Environment Setup${RESET}                       ${BOLD}${CYAN}║${RESET}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+# ---------------------------
+# Main flow
+# ---------------------------
+[[ "$SKIP_DETECT" != "y" ]] && show_environment
+choose_components
+show_plan
+run_installs
+show_summary
