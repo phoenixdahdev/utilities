@@ -507,13 +507,22 @@ setup_node() {
     [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
     npm install -g pm2
   "
-  # PM2 startup
-  sudo -u "$DEPLOY_USER" bash -c "
+
+  # PM2 startup — pm2 startup just prints the sudo command;
+  # we need to capture it and actually execute it to install the systemd unit.
+  info "Registering PM2 with systemd ..."
+  local pm2_startup_cmd
+  pm2_startup_cmd=$(sudo -u "$DEPLOY_USER" bash -c "
     export NVM_DIR='$nvm_dir'
     [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
-    pm2 startup systemd -u $DEPLOY_USER --hp /home/$DEPLOY_USER 2>/dev/null || true
-  " || true
-  success "PM2 installed with startup hook"
+    pm2 startup systemd -u $DEPLOY_USER --hp /home/$DEPLOY_USER 2>&1 | grep -E '^sudo env' || true
+  ")
+  if [[ -n "$pm2_startup_cmd" ]]; then
+    eval "$pm2_startup_cmd" >/dev/null 2>&1 || true
+    success "PM2 systemd unit installed (pm2-${DEPLOY_USER}.service)"
+  else
+    warn "Could not auto-register PM2 with systemd — run 'pm2 startup' manually"
+  fi
 }
 
 setup_python() {
@@ -572,13 +581,13 @@ NGXEOF
 
   # Harden nginx.conf
   info "Hardening nginx.conf ..."
-  # Disable server tokens
-  if ! grep -q "server_tokens off" /etc/nginx/nginx.conf; then
+  # Disable server tokens (match only uncommented directive)
+  if ! grep -qE '^\s*server_tokens\s+off' /etc/nginx/nginx.conf; then
     sudo sed -i '/http {/a \\tserver_tokens off;' /etc/nginx/nginx.conf
   fi
 
-  # Increase client_max_body_size
-  if ! grep -q "client_max_body_size" /etc/nginx/nginx.conf; then
+  # Increase client_max_body_size (match only uncommented directive)
+  if ! grep -qE '^\s*client_max_body_size' /etc/nginx/nginx.conf; then
     sudo sed -i '/http {/a \\tclient_max_body_size 64m;' /etc/nginx/nginx.conf
   fi
 
@@ -693,7 +702,7 @@ setup_logrotate() {
   sudo mkdir -p /var/log/apps
   sudo chown "${DEPLOY_USER}:${DEPLOY_USER}" /var/log/apps 2>/dev/null || true
 
-  sudo tee /etc/logrotate.d/apps >/dev/null <<'LREOF'
+  sudo tee /etc/logrotate.d/apps >/dev/null <<LREOF
 /var/log/apps/*.log {
     daily
     missingok
@@ -701,7 +710,7 @@ setup_logrotate() {
     compress
     delaycompress
     notifempty
-    create 0640 deploy deploy
+    create 0640 ${DEPLOY_USER} ${DEPLOY_USER}
     sharedscripts
 }
 LREOF
@@ -717,6 +726,16 @@ run_setup() {
 
   [[ "$DO_SYSTEM" == "y" ]]    && setup_system
   [[ "$DO_SECURITY" == "y" ]]  && setup_security
+
+  # Resolve target user for later modules.
+  # If Security didn't run and the deploy user doesn't exist,
+  # fall back to the current user (SUDO_USER if running under sudo, else USER).
+  if ! id "$DEPLOY_USER" &>/dev/null; then
+    local fallback_user="${SUDO_USER:-$USER}"
+    warn "Deploy user '${DEPLOY_USER}' does not exist — falling back to '${fallback_user}' for user-scoped installs."
+    DEPLOY_USER="$fallback_user"
+  fi
+
   [[ "$DO_SWAP" == "y" ]]      && setup_swap
   [[ "$DO_NODE" == "y" ]]      && setup_node
   [[ "$DO_PYTHON" == "y" ]]    && setup_python
