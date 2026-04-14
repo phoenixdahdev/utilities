@@ -1,0 +1,1155 @@
+#!/bin/bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════
+#  deploy-app — Interactive app deployment wizard
+#  Ties together: git clone → install → build → nginx → SSL → pm2
+# ═══════════════════════════════════════════════════════════════
+
+# ---------------------------
+# Colors & formatting
+# ---------------------------
+BOLD='\033[1m'
+DIM='\033[2m'
+UNDERLINE='\033[4m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+RESET='\033[0m'
+
+info()    { echo -e "${BLUE}ℹ${RESET}  $1"; }
+success() { echo -e "${GREEN}✔${RESET}  $1"; }
+warn()    { echo -e "${YELLOW}⚠${RESET}  $1"; }
+error()   { echo -e "${RED}✖${RESET}  $1"; }
+step()    { echo -e "\n${BOLD}${CYAN}[$1]${RESET} ${BOLD}$2${RESET}"; }
+divider() { echo -e "${DIM}$(printf '─%.0s' {1..60})${RESET}"; }
+
+ask() {
+  local prompt="$1" var="$2" default="${3:-}"
+  if [[ -n "$default" ]]; then
+    echo -en "  ${WHITE}${prompt}${RESET} ${DIM}(${default})${RESET}: "
+    read -r input
+    eval "$var='${input:-$default}'"
+  else
+    echo -en "  ${WHITE}${prompt}${RESET}: "
+    read -r input
+    eval "$var='$input'"
+  fi
+}
+
+ask_secret() {
+  local prompt="$1" var="$2"
+  echo -en "  ${WHITE}${prompt}${RESET}: "
+  read -rs input
+  echo
+  eval "$var='$input'"
+}
+
+ask_yesno() {
+  local prompt="$1" var="$2" default="${3:-n}"
+  local hint
+  if [[ "$default" == "y" ]]; then hint="Y/n"; else hint="y/N"; fi
+  echo -en "  ${WHITE}${prompt}${RESET} ${DIM}(${hint})${RESET}: "
+  read -r input
+  input="${input:-$default}"
+  if [[ "${input,,}" == "y" || "${input,,}" == "yes" ]]; then
+    eval "$var='y'"
+  else
+    eval "$var='n'"
+  fi
+}
+
+confirm_or_abort() {
+  echo
+  ask_yesno "Proceed?" CONFIRM "n"
+  if [[ "$CONFIRM" != "y" ]]; then
+    echo
+    warn "Aborted."
+    exit 0
+  fi
+}
+
+has_cmd() { command -v "$1" &>/dev/null; }
+
+show_help() {
+cat <<EOF
+Usage: $0 [command] [options]
+
+Interactive app deployment wizard. Git clone → install → build → nginx → SSL → pm2.
+
+Commands:
+  (default)                Interactive wizard — deploy a new app
+  --redeploy NAME          Quick redeploy: pull, install, build, restart
+  --list                   List all deployed apps
+  --logs NAME              Tail pm2 logs for an app
+  --remove NAME            Tear down an app (nginx, pm2, files)
+  --restart NAME           Restart an app via pm2
+
+Options (for default wizard):
+  --name NAME              App name (used for pm2, nginx, /var/www)
+  --repo URL               Git repo URL (or --path for local dir)
+  --path DIR               Path to already-cloned app (skips git)
+  --branch NAME            Git branch to deploy (default: main)
+  --domain DOMAIN          Domain name (for nginx server_name + SSL)
+  --port PORT              Port the app listens on (auto-detected / picked)
+  --type TYPE              Framework: node | python | static | docker
+  --no-ssl                 Skip Let's Encrypt SSL
+  --no-db                  Skip database creation
+  --help                   Show this help
+
+Examples:
+  $0                                              # interactive wizard
+  $0 --redeploy myapp                             # pull latest, restart
+  $0 --list                                       # show deployed apps
+  $0 --logs myapp                                 # tail logs
+  $0 --remove myapp                               # tear down
+EOF
+exit 0
+}
+
+# ---------------------------
+# Resolve app/user context
+# ---------------------------
+APP_USER="${SUDO_USER:-$USER}"
+APP_HOME=$(getent passwd "$APP_USER" | cut -d: -f6)
+APPS_ROOT="/var/www"
+NGINX_AVAILABLE="/etc/nginx/sites-available"
+NGINX_ENABLED="/etc/nginx/sites-enabled"
+
+# Run a command as the app user with NVM loaded
+as_app_user() {
+  sudo -u "$APP_USER" bash -c "
+    export NVM_DIR=\"\$HOME/.config/nvm\"
+    [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+    export PATH=\"\$HOME/.local/bin:\$PATH\"
+    $*
+  "
+}
+
+# ---------------------------
+# Server readiness check
+# ---------------------------
+check_server_readiness() {
+  local missing=()
+  has_cmd git     || missing+=("git")
+  has_cmd nginx   || missing+=("nginx")
+  has_cmd curl    || missing+=("curl")
+
+  # PM2 — check via as_app_user since it's installed via nvm
+  if ! as_app_user "command -v pm2 >/dev/null" 2>/dev/null; then
+    missing+=("pm2")
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    error "Server is missing required tools: ${missing[*]}"
+    echo -e "  Run ${CYAN}./server-setup${RESET} to install them first."
+    exit 1
+  fi
+}
+
+# ---------------------------
+# Framework detection
+# ---------------------------
+detect_framework() {
+  local dir="$1"
+  if [[ -f "$dir/Dockerfile" ]] || [[ -f "$dir/docker-compose.yml" ]] || [[ -f "$dir/compose.yml" ]]; then
+    echo "docker"
+  elif [[ -f "$dir/package.json" ]]; then
+    echo "node"
+  elif [[ -f "$dir/requirements.txt" ]] || [[ -f "$dir/pyproject.toml" ]] || [[ -f "$dir/setup.py" ]]; then
+    echo "python"
+  elif [[ -f "$dir/index.html" ]]; then
+    echo "static"
+  else
+    echo "unknown"
+  fi
+}
+
+detect_node_subframework() {
+  local dir="$1"
+  if [[ ! -f "$dir/package.json" ]]; then echo "none"; return; fi
+  if grep -q '"next"' "$dir/package.json" 2>/dev/null; then echo "nextjs"
+  elif grep -q '"nuxt"' "$dir/package.json" 2>/dev/null; then echo "nuxt"
+  elif grep -q '"@sveltejs/kit"' "$dir/package.json" 2>/dev/null; then echo "sveltekit"
+  elif grep -q '"astro"' "$dir/package.json" 2>/dev/null; then echo "astro"
+  elif grep -q '"vite"' "$dir/package.json" 2>/dev/null; then echo "vite"
+  elif grep -q '"express"' "$dir/package.json" 2>/dev/null; then echo "express"
+  elif grep -q '"fastify"' "$dir/package.json" 2>/dev/null; then echo "fastify"
+  elif grep -q '"nestjs"\|"@nestjs/' "$dir/package.json" 2>/dev/null; then echo "nestjs"
+  else echo "generic-node"
+  fi
+}
+
+detect_node_pm() {
+  local dir="$1"
+  [[ -f "$dir/pnpm-lock.yaml" ]] && echo "pnpm" && return
+  [[ -f "$dir/yarn.lock" ]] && echo "yarn" && return
+  [[ -f "$dir/bun.lockb" ]] && echo "bun" && return
+  echo "npm"
+}
+
+suggest_commands() {
+  local type="$1" subfw="$2" pm="$3"
+  case "$type" in
+    node)
+      case "$subfw" in
+        nextjs)
+          SUGGEST_INSTALL="$pm install"
+          SUGGEST_BUILD="$pm run build"
+          SUGGEST_START="$pm start"
+          SUGGEST_PORT="3000"
+          IS_STATIC="n"
+          ;;
+        vite|astro|sveltekit)
+          SUGGEST_INSTALL="$pm install"
+          SUGGEST_BUILD="$pm run build"
+          SUGGEST_START=""
+          SUGGEST_PORT=""
+          IS_STATIC="y"
+          STATIC_DIR="dist"
+          [[ "$subfw" == "astro" ]] && STATIC_DIR="dist"
+          [[ "$subfw" == "sveltekit" ]] && STATIC_DIR="build"
+          ;;
+        *)
+          SUGGEST_INSTALL="$pm install"
+          SUGGEST_BUILD=""
+          SUGGEST_START="$pm start"
+          SUGGEST_PORT="3000"
+          IS_STATIC="n"
+          ;;
+      esac
+      ;;
+    python)
+      SUGGEST_INSTALL="python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/pip install gunicorn"
+      SUGGEST_BUILD=""
+      SUGGEST_START=".venv/bin/gunicorn app:app --bind 127.0.0.1:8000"
+      SUGGEST_PORT="8000"
+      IS_STATIC="n"
+      ;;
+    static)
+      SUGGEST_INSTALL=""
+      SUGGEST_BUILD=""
+      SUGGEST_START=""
+      SUGGEST_PORT=""
+      IS_STATIC="y"
+      STATIC_DIR="."
+      ;;
+    docker)
+      SUGGEST_INSTALL=""
+      SUGGEST_BUILD="docker compose build"
+      SUGGEST_START="docker compose up -d"
+      SUGGEST_PORT="8080"
+      IS_STATIC="n"
+      ;;
+  esac
+}
+
+# ---------------------------
+# DNS check
+# ---------------------------
+check_dns() {
+  local domain="$1"
+  local server_ip resolved_ip
+  server_ip=$(curl -fsSL --max-time 3 ifconfig.me 2>/dev/null || echo "")
+  resolved_ip=$(dig +short "$domain" A 2>/dev/null | tail -1)
+
+  if [[ -z "$resolved_ip" ]]; then
+    warn "Domain '${domain}' does not resolve. SSL will fail until DNS propagates."
+    return 1
+  fi
+
+  if [[ "$resolved_ip" != "$server_ip" ]]; then
+    warn "Domain '${domain}' resolves to ${resolved_ip}, but this server is ${server_ip}."
+    warn "SSL certificate will fail until DNS is correct."
+    return 1
+  fi
+
+  success "DNS OK — ${domain} → ${server_ip}"
+  return 0
+}
+
+# ---------------------------
+# List deployed apps
+# ---------------------------
+cmd_list() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Deployed Apps${RESET}                                ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+  echo
+
+  # List from /var/www — only directories deployed by this tool (marker file)
+  local found=0
+  if [[ -d "$APPS_ROOT" ]]; then
+    for dir in "$APPS_ROOT"/*/; do
+      [[ -d "$dir" ]] || continue
+      # Skip dirs not deployed by this tool
+      [[ -f "${dir}.deploy-state" ]] || continue
+      found=1
+      local name=$(basename "$dir")
+      local nginx_status="—"
+      local pm2_status="—"
+      local domain="—"
+
+      # nginx site?
+      if [[ -f "$NGINX_AVAILABLE/$name" ]]; then
+        if [[ -L "$NGINX_ENABLED/$name" ]]; then
+          nginx_status="${GREEN}enabled${RESET}"
+        else
+          nginx_status="${YELLOW}disabled${RESET}"
+        fi
+        domain=$(grep -E '^\s*server_name' "$NGINX_AVAILABLE/$name" 2>/dev/null | \
+          awk '{print $2}' | tr -d ';' | head -1)
+      fi
+
+      # pm2 process?
+      if as_app_user "pm2 list 2>/dev/null | grep -q \" $name \""; then
+        pm2_status="${GREEN}online${RESET}"
+      fi
+
+      echo -e "  ${BOLD}${name}${RESET}"
+      echo -e "    ${DIM}Domain ...${RESET} ${domain:-—}"
+      echo -e "    ${DIM}Nginx ....${RESET} $(echo -e "$nginx_status")"
+      echo -e "    ${DIM}PM2 ......${RESET} $(echo -e "$pm2_status")"
+      echo -e "    ${DIM}Path .....${RESET} ${dir%/}"
+      echo
+    done
+  fi
+
+  if [[ $found -eq 0 ]]; then
+    warn "No apps deployed yet."
+    echo -e "  Run ${CYAN}$0${RESET} to deploy your first app."
+  fi
+
+  exit 0
+}
+
+# ---------------------------
+# Tail logs
+# ---------------------------
+cmd_logs() {
+  local name="$1"
+  [[ -z "$name" ]] && { error "--logs requires an app name"; exit 1; }
+
+  info "Tailing logs for '${name}' (Ctrl+C to stop) ..."
+  as_app_user "pm2 logs $name"
+  exit 0
+}
+
+# ---------------------------
+# Restart
+# ---------------------------
+cmd_restart() {
+  local name="$1"
+  [[ -z "$name" ]] && { error "--restart requires an app name"; exit 1; }
+
+  echo -en "  Restarting '${name}' ... "
+  as_app_user "pm2 restart $name"
+  echo -e "${GREEN}done${RESET}"
+  exit 0
+}
+
+# ---------------------------
+# Remove app
+# ---------------------------
+cmd_remove() {
+  local name="$1"
+  [[ -z "$name" ]] && { error "--remove requires an app name"; exit 1; }
+
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Remove Deployed App${RESET}                         ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  local app_dir="$APPS_ROOT/$name"
+  echo
+  echo -e "  ${RED}${BOLD}Will remove:${RESET}"
+  [[ -f "$NGINX_AVAILABLE/$name" ]]     && echo -e "    • nginx site ${WHITE}${NGINX_AVAILABLE}/${name}${RESET}"
+  [[ -L "$NGINX_ENABLED/$name" ]]       && echo -e "    • nginx symlink ${WHITE}${NGINX_ENABLED}/${name}${RESET}"
+  if as_app_user "pm2 list 2>/dev/null | grep -q \" $name \""; then
+    echo -e "    • pm2 process ${WHITE}${name}${RESET}"
+  fi
+  [[ -d "$app_dir" ]] && echo -e "    • directory ${WHITE}${app_dir}${RESET}"
+
+  echo
+  echo -en "  ${WHITE}Type the app name to confirm:${RESET} "
+  read -r confirm_name
+  if [[ "$confirm_name" != "$name" ]]; then
+    error "Name does not match. Aborted."
+    exit 1
+  fi
+
+  # Stop + delete pm2 process
+  if as_app_user "pm2 list 2>/dev/null | grep -q \" $name \""; then
+    echo -en "  Stopping pm2 process ... "
+    as_app_user "pm2 delete $name 2>/dev/null; pm2 save" >/dev/null 2>&1 || true
+    echo -e "${GREEN}done${RESET}"
+  fi
+
+  # Remove nginx
+  if [[ -L "$NGINX_ENABLED/$name" ]]; then
+    echo -en "  Disabling nginx site ... "
+    sudo rm -f "$NGINX_ENABLED/$name"
+    echo -e "${GREEN}done${RESET}"
+  fi
+  if [[ -f "$NGINX_AVAILABLE/$name" ]]; then
+    echo -en "  Removing nginx config ... "
+    sudo rm -f "$NGINX_AVAILABLE/$name"
+    echo -e "${GREEN}done${RESET}"
+  fi
+  sudo nginx -t >/dev/null 2>&1 && sudo systemctl reload nginx 2>/dev/null || true
+
+  # Remove directory
+  if [[ -d "$app_dir" ]]; then
+    echo -en "  Removing files ... "
+    sudo rm -rf "$app_dir"
+    echo -e "${GREEN}done${RESET}"
+  fi
+
+  echo
+  success "'${name}' has been removed."
+  echo -e "  ${DIM}Note: SSL cert (if any) still lives in /etc/letsencrypt/. Run 'sudo certbot delete' to remove it.${RESET}"
+  echo
+  exit 0
+}
+
+# ---------------------------
+# Redeploy (quick)
+# ---------------------------
+cmd_redeploy() {
+  local name="$1"
+  [[ -z "$name" ]] && { error "--redeploy requires an app name"; exit 1; }
+
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Quick Redeploy${RESET}                              ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  local app_dir="$APPS_ROOT/$name"
+  if [[ ! -d "$app_dir" ]]; then
+    error "App directory '${app_dir}' not found."
+    exit 1
+  fi
+
+  echo
+  info "Redeploying '${name}' at ${app_dir}"
+
+  # Read state file if present
+  local state_file="${app_dir}/.deploy-state"
+  local install_cmd="" build_cmd="" app_type=""
+  if [[ -f "$state_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$state_file"
+    install_cmd="${INSTALL_CMD:-}"
+    build_cmd="${BUILD_CMD:-}"
+    app_type="${APP_TYPE:-}"
+  fi
+
+  # Git pull if it's a repo
+  if [[ -d "$app_dir/.git" ]]; then
+    echo -en "  Pulling latest from git ... "
+    sudo -u "$APP_USER" git -C "$app_dir" pull --ff-only >/dev/null 2>&1
+    echo -e "${GREEN}done${RESET}"
+  else
+    warn "Not a git repo — skipping pull (you must update files manually)"
+  fi
+
+  # Install
+  if [[ -n "$install_cmd" ]]; then
+    echo -en "  Running install: ${DIM}${install_cmd}${RESET} ... "
+    as_app_user "cd '$app_dir' && $install_cmd" >/dev/null 2>&1
+    echo -e "${GREEN}done${RESET}"
+  fi
+
+  # Build
+  if [[ -n "$build_cmd" ]]; then
+    echo -en "  Running build:   ${DIM}${build_cmd}${RESET} ... "
+    as_app_user "cd '$app_dir' && $build_cmd" >/dev/null 2>&1
+    echo -e "${GREEN}done${RESET}"
+  fi
+
+  # Restart pm2
+  if as_app_user "pm2 list 2>/dev/null | grep -q \" $name \""; then
+    echo -en "  Reloading pm2 process ... "
+    as_app_user "pm2 reload $name --update-env"
+    echo -e "${GREEN}done${RESET}"
+  else
+    warn "No pm2 process found for '${name}' — is it a static site?"
+    # Reload nginx for static sites
+    sudo systemctl reload nginx 2>/dev/null || true
+  fi
+
+  echo
+  success "Redeploy complete."
+  echo
+  exit 0
+}
+
+# ---------------------------
+# Main deployment wizard
+# ---------------------------
+
+# Collected values
+APP_NAME=""
+APP_REPO=""
+APP_PATH=""
+APP_BRANCH="main"
+APP_DOMAIN=""
+APP_PORT=""
+APP_TYPE=""
+APP_SUBFRAMEWORK=""
+APP_PM=""
+APP_DIR=""
+INSTALL_CMD=""
+BUILD_CMD=""
+START_CMD=""
+IS_STATIC="n"
+STATIC_DIR=""
+USE_SSL="y"
+SSL_EMAIL=""
+USE_DB="n"
+DB_NAME_VAL=""
+DB_USER_VAL=""
+DB_PASS_VAL=""
+DB_ORM=""
+ENV_FILE_CONTENT=""
+
+SUGGEST_INSTALL=""
+SUGGEST_BUILD=""
+SUGGEST_START=""
+SUGGEST_PORT=""
+
+collect_app_info() {
+  step "1" "Application info"
+  divider
+
+  # Name
+  if [[ -z "$APP_NAME" ]]; then
+    ask "App name (used for pm2, nginx, /var/www)" APP_NAME
+    while [[ -z "$APP_NAME" || ! "$APP_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; do
+      error "App name must contain only letters, numbers, dashes, underscores."
+      ask "App name" APP_NAME
+    done
+  fi
+
+  APP_DIR="$APPS_ROOT/$APP_NAME"
+
+  # Check if already deployed
+  if [[ -d "$APP_DIR" ]]; then
+    warn "Directory '${APP_DIR}' already exists."
+    ask_yesno "Continue anyway? (may overwrite files)" OVERWRITE "n"
+    if [[ "$OVERWRITE" != "y" ]]; then
+      warn "Aborted. Use ${CYAN}$0 --redeploy $APP_NAME${RESET} for a quick update."
+      exit 0
+    fi
+  fi
+
+  # Source
+  if [[ -z "$APP_REPO" && -z "$APP_PATH" ]]; then
+    echo
+    echo -e "  ${WHITE}Source:${RESET}"
+    echo -e "    ${CYAN}1)${RESET} Git repository (clone to /var/www/${APP_NAME})"
+    echo -e "    ${CYAN}2)${RESET} Local directory (already on this server)"
+    while true; do
+      echo -en "  ${WHITE}Choose [1-2]${RESET} ${DIM}(1)${RESET}: "
+      read -r src_choice
+      src_choice="${src_choice:-1}"
+      case "$src_choice" in
+        1) break ;;
+        2) break ;;
+        *) error "Invalid choice." ;;
+      esac
+    done
+
+    if [[ "$src_choice" == "1" ]]; then
+      ask "Git repository URL" APP_REPO
+      while [[ -z "$APP_REPO" ]]; do
+        error "Repo URL required."
+        ask "Git repository URL" APP_REPO
+      done
+      ask "Branch" APP_BRANCH "$APP_BRANCH"
+    else
+      ask "Local directory path" APP_PATH
+      while [[ ! -d "$APP_PATH" ]]; do
+        error "Directory does not exist: $APP_PATH"
+        ask "Local directory path" APP_PATH
+      done
+    fi
+  fi
+}
+
+clone_or_copy() {
+  step "2" "Fetching source"
+  divider
+
+  # Ensure parent dir exists + owned
+  sudo mkdir -p "$APPS_ROOT"
+  sudo chown "$APP_USER:$APP_USER" "$APPS_ROOT"
+
+  if [[ -n "$APP_REPO" ]]; then
+    if [[ -d "$APP_DIR/.git" ]]; then
+      echo -en "  Pulling latest from git ... "
+      sudo -u "$APP_USER" git -C "$APP_DIR" pull --ff-only >/dev/null 2>&1
+      echo -e "${GREEN}done${RESET}"
+    else
+      echo -en "  Cloning ${APP_REPO} (branch: ${APP_BRANCH}) ... "
+      sudo -u "$APP_USER" git clone -b "$APP_BRANCH" "$APP_REPO" "$APP_DIR" >/dev/null 2>&1 || {
+        echo -e "${RED}failed${RESET}"
+        error "Git clone failed. Check the URL and branch."
+        exit 1
+      }
+      echo -e "${GREEN}done${RESET}"
+    fi
+  elif [[ -n "$APP_PATH" ]]; then
+    if [[ "$APP_PATH" != "$APP_DIR" ]]; then
+      echo -en "  Copying ${APP_PATH} to ${APP_DIR} ... "
+      sudo mkdir -p "$APP_DIR"
+      sudo cp -r "$APP_PATH"/. "$APP_DIR/"
+      sudo chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+      echo -e "${GREEN}done${RESET}"
+    else
+      success "Using existing directory at ${APP_DIR}"
+    fi
+  fi
+}
+
+detect_and_configure() {
+  step "3" "Framework & commands"
+  divider
+
+  # Auto-detect
+  if [[ -z "$APP_TYPE" ]]; then
+    APP_TYPE=$(detect_framework "$APP_DIR")
+  fi
+
+  if [[ "$APP_TYPE" == "unknown" ]]; then
+    echo -e "  ${WHITE}Could not auto-detect framework. Choose:${RESET}"
+    echo -e "    ${CYAN}1)${RESET} node       ${DIM}— Node.js app (pm2 + reverse proxy)${RESET}"
+    echo -e "    ${CYAN}2)${RESET} python     ${DIM}— Python app (gunicorn + reverse proxy)${RESET}"
+    echo -e "    ${CYAN}3)${RESET} static     ${DIM}— Static files (nginx serves directly)${RESET}"
+    echo -e "    ${CYAN}4)${RESET} docker     ${DIM}— Docker Compose${RESET}"
+    while true; do
+      echo -en "  ${WHITE}Choose [1-4]${RESET}: "
+      read -r t
+      case "$t" in
+        1) APP_TYPE="node";   break ;;
+        2) APP_TYPE="python"; break ;;
+        3) APP_TYPE="static"; break ;;
+        4) APP_TYPE="docker"; break ;;
+        *) error "Invalid choice." ;;
+      esac
+    done
+  else
+    info "Detected framework: ${WHITE}${APP_TYPE}${RESET}"
+  fi
+
+  # Node subframework
+  if [[ "$APP_TYPE" == "node" ]]; then
+    APP_SUBFRAMEWORK=$(detect_node_subframework "$APP_DIR")
+    APP_PM=$(detect_node_pm "$APP_DIR")
+    info "Node subframework: ${WHITE}${APP_SUBFRAMEWORK}${RESET}, package manager: ${WHITE}${APP_PM}${RESET}"
+  fi
+
+  suggest_commands "$APP_TYPE" "$APP_SUBFRAMEWORK" "$APP_PM"
+
+  # Install
+  if [[ -n "$SUGGEST_INSTALL" ]]; then
+    ask "Install command" INSTALL_CMD "$SUGGEST_INSTALL"
+  fi
+
+  # Build
+  if [[ -n "$SUGGEST_BUILD" ]]; then
+    ask "Build command (empty to skip)" BUILD_CMD "$SUGGEST_BUILD"
+  fi
+
+  # Start / static
+  if [[ "$IS_STATIC" == "y" ]]; then
+    ask "Static files directory (relative to repo)" STATIC_DIR "$STATIC_DIR"
+  else
+    if [[ -n "$SUGGEST_START" ]]; then
+      ask "Start command" START_CMD "$SUGGEST_START"
+    fi
+    ask "Port the app listens on" APP_PORT "${SUGGEST_PORT:-3000}"
+  fi
+}
+
+collect_domain_ssl() {
+  step "4" "Domain & SSL"
+  divider
+
+  if [[ -z "$APP_DOMAIN" ]]; then
+    ask "Domain (e.g., myapp.example.com)" APP_DOMAIN
+    while [[ -z "$APP_DOMAIN" ]]; do
+      error "Domain required."
+      ask "Domain" APP_DOMAIN
+    done
+  fi
+
+  # DNS check
+  echo
+  check_dns "$APP_DOMAIN" || true
+  echo
+
+  if [[ "$USE_SSL" == "y" ]]; then
+    ask_yesno "Get Let's Encrypt SSL certificate?" USE_SSL "y"
+    if [[ "$USE_SSL" == "y" ]]; then
+      ask "Email for Let's Encrypt" SSL_EMAIL
+      while [[ -z "$SSL_EMAIL" ]]; do
+        error "Email required for Let's Encrypt."
+        ask "Email" SSL_EMAIL
+      done
+    fi
+  fi
+}
+
+collect_database() {
+  step "5" "Database"
+  divider
+
+  if [[ "$USE_DB" != "skip" ]]; then
+    ask_yesno "Does this app need a PostgreSQL database?" USE_DB "n"
+  fi
+
+  if [[ "$USE_DB" == "y" ]]; then
+    if ! has_cmd psql; then
+      warn "PostgreSQL is not installed on this server."
+      USE_DB="n"
+      return
+    fi
+
+    ask "Database name" DB_NAME_VAL "${APP_NAME}"
+    ask "Database user" DB_USER_VAL "${APP_NAME}_user"
+    ask_secret "Database password" DB_PASS_VAL
+    while [[ -z "$DB_PASS_VAL" ]]; do
+      error "Password required."
+      ask_secret "Database password" DB_PASS_VAL
+    done
+
+    echo -e "  ${WHITE}ORM / privilege set:${RESET}"
+    echo -e "    ${CYAN}1)${RESET} prisma"
+    echo -e "    ${CYAN}2)${RESET} typeorm"
+    echo -e "    ${CYAN}3)${RESET} sequelize"
+    echo -e "    ${CYAN}4)${RESET} django"
+    echo -e "    ${CYAN}5)${RESET} generic"
+    while true; do
+      echo -en "  ${WHITE}Choose [1-5]${RESET} ${DIM}(1)${RESET}: "
+      read -r orm_choice
+      orm_choice="${orm_choice:-1}"
+      case "$orm_choice" in
+        1) DB_ORM="prisma";    break ;;
+        2) DB_ORM="typeorm";   break ;;
+        3) DB_ORM="sequelize"; break ;;
+        4) DB_ORM="django";    break ;;
+        5) DB_ORM="generic";   break ;;
+        *) error "Invalid choice." ;;
+      esac
+    done
+  fi
+}
+
+collect_env() {
+  step "6" "Environment variables"
+  divider
+
+  echo -e "  ${DIM}You can:${RESET}"
+  echo -e "    ${CYAN}1)${RESET} Paste .env contents (end with a line containing only 'EOF')"
+  echo -e "    ${CYAN}2)${RESET} Load from a file on this server"
+  echo -e "    ${CYAN}3)${RESET} Skip (write a blank .env)"
+  while true; do
+    echo -en "  ${WHITE}Choose [1-3]${RESET} ${DIM}(3)${RESET}: "
+    read -r env_choice
+    env_choice="${env_choice:-3}"
+    case "$env_choice" in
+      1)
+        echo -e "  ${DIM}Paste .env contents, then type EOF on its own line:${RESET}"
+        ENV_FILE_CONTENT=""
+        while IFS= read -r line; do
+          [[ "$line" == "EOF" ]] && break
+          ENV_FILE_CONTENT+="${line}"$'\n'
+        done
+        break
+        ;;
+      2)
+        local env_src
+        ask "Path to .env file" env_src
+        while [[ ! -f "$env_src" ]]; do
+          error "File not found: $env_src"
+          ask "Path to .env file" env_src
+        done
+        ENV_FILE_CONTENT=$(cat "$env_src")
+        break
+        ;;
+      3)
+        ENV_FILE_CONTENT=""
+        break
+        ;;
+      *) error "Invalid choice." ;;
+    esac
+  done
+}
+
+# ---------------------------
+# Review plan
+# ---------------------------
+show_plan() {
+  step "7" "Review"
+  divider
+  echo
+  echo -e "  ${BOLD}Deployment plan for '${APP_NAME}':${RESET}"
+  echo
+  echo -e "  ${DIM}Source ............${RESET} ${APP_REPO:-$APP_PATH} ${DIM}${APP_BRANCH:+($APP_BRANCH)}${RESET}"
+  echo -e "  ${DIM}Destination .......${RESET} ${APP_DIR}"
+  echo -e "  ${DIM}Framework .........${RESET} ${APP_TYPE}${APP_SUBFRAMEWORK:+ / $APP_SUBFRAMEWORK}"
+  [[ -n "$INSTALL_CMD" ]] && echo -e "  ${DIM}Install ...........${RESET} ${INSTALL_CMD}"
+  [[ -n "$BUILD_CMD" ]]   && echo -e "  ${DIM}Build .............${RESET} ${BUILD_CMD}"
+  if [[ "$IS_STATIC" == "y" ]]; then
+    echo -e "  ${DIM}Static dir ........${RESET} ${STATIC_DIR}"
+  else
+    echo -e "  ${DIM}Start .............${RESET} ${START_CMD}"
+    echo -e "  ${DIM}Port ..............${RESET} ${APP_PORT}"
+  fi
+  echo -e "  ${DIM}Domain ............${RESET} ${APP_DOMAIN}"
+  echo -e "  ${DIM}SSL ...............${RESET} $([[ "$USE_SSL" == "y" ]] && echo "yes (${SSL_EMAIL})" || echo "no")"
+  echo -e "  ${DIM}Database ..........${RESET} $([[ "$USE_DB" == "y" ]] && echo "${DB_NAME_VAL} (${DB_ORM})" || echo "no")"
+  echo -e "  ${DIM}.env ..............${RESET} $([[ -n "$ENV_FILE_CONTENT" ]] && echo "$(echo -n "$ENV_FILE_CONTENT" | grep -c '=') vars" || echo "empty")"
+
+  confirm_or_abort
+}
+
+# ---------------------------
+# Execution steps
+# ---------------------------
+create_database_if_needed() {
+  if [[ "$USE_DB" != "y" ]]; then return; fi
+
+  step "▸" "Database"
+
+  local cpg_script
+  cpg_script="$(dirname "$(readlink -f "$0")")/create-pg-database"
+  if [[ ! -x "$cpg_script" ]]; then
+    # Try same directory as deploy-app
+    cpg_script="$(pwd)/create-pg-database"
+  fi
+
+  if [[ -x "$cpg_script" ]]; then
+    "$cpg_script" --non-interactive \
+      --db-name "$DB_NAME_VAL" \
+      --user "$DB_USER_VAL" \
+      --password "$DB_PASS_VAL" \
+      --orm "$DB_ORM" || warn "Database setup returned non-zero; check output above."
+  else
+    warn "create-pg-database not found alongside this script. Creating DB inline ..."
+    sudo -u postgres psql -q <<EOF
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER_VAL}') THEN
+    CREATE ROLE "${DB_USER_VAL}" LOGIN PASSWORD '${DB_PASS_VAL}';
+  END IF;
+END \$\$;
+EOF
+    sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME_VAL}'" | grep -q 1 || \
+      sudo -u postgres psql -q -c "CREATE DATABASE \"${DB_NAME_VAL}\" OWNER \"${DB_USER_VAL}\";"
+    success "Database '${DB_NAME_VAL}' created"
+  fi
+}
+
+write_env_file() {
+  step "▸" "Writing .env"
+
+  local env_path="$APP_DIR/.env"
+  local tmp_env
+  tmp_env=$(mktemp)
+
+  # Start with user-provided content
+  echo "$ENV_FILE_CONTENT" > "$tmp_env"
+
+  # Append DATABASE_URL if we created a DB and user didn't already include one
+  if [[ "$USE_DB" == "y" ]] && ! grep -q '^DATABASE_URL=' "$tmp_env" 2>/dev/null; then
+    local pg_port
+    pg_port=$(sudo -u postgres psql -tAc "SHOW port;" 2>/dev/null | xargs || echo "5432")
+    echo "DATABASE_URL=postgresql://${DB_USER_VAL}:${DB_PASS_VAL}@localhost:${pg_port}/${DB_NAME_VAL}" \
+      >> "$tmp_env"
+  fi
+
+  # Append PORT if not already set and we're non-static
+  if [[ "$IS_STATIC" != "y" ]] && ! grep -q '^PORT=' "$tmp_env" 2>/dev/null; then
+    echo "PORT=${APP_PORT}" >> "$tmp_env"
+  fi
+
+  # Move into place
+  sudo mv "$tmp_env" "$env_path"
+  sudo chown "$APP_USER:$APP_USER" "$env_path"
+  sudo chmod 600 "$env_path"
+  success ".env written to ${env_path}"
+}
+
+run_install_build() {
+  if [[ -n "$INSTALL_CMD" ]]; then
+    step "▸" "Install"
+    info "Running: ${INSTALL_CMD}"
+    as_app_user "cd '$APP_DIR' && $INSTALL_CMD"
+    success "Install complete"
+  fi
+
+  if [[ -n "$BUILD_CMD" ]]; then
+    step "▸" "Build"
+    info "Running: ${BUILD_CMD}"
+    as_app_user "cd '$APP_DIR' && $BUILD_CMD"
+    success "Build complete"
+  fi
+}
+
+write_nginx_config() {
+  step "▸" "nginx site"
+
+  local conf_path="$NGINX_AVAILABLE/$APP_NAME"
+
+  if [[ "$IS_STATIC" == "y" ]]; then
+    local root_path="$APP_DIR"
+    [[ "$STATIC_DIR" != "." && "$STATIC_DIR" != "./" ]] && root_path="$APP_DIR/$STATIC_DIR"
+
+    sudo tee "$conf_path" >/dev/null <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${APP_DOMAIN};
+
+    root ${root_path};
+    index index.html;
+
+    access_log /var/log/nginx/${APP_NAME}.access.log;
+    error_log  /var/log/nginx/${APP_NAME}.error.log;
+
+    include /etc/nginx/snippets/security-headers.conf;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)\$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+}
+NGINX
+  else
+    sudo tee "$conf_path" >/dev/null <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${APP_DOMAIN};
+
+    access_log /var/log/nginx/${APP_NAME}.access.log;
+    error_log  /var/log/nginx/${APP_NAME}.error.log;
+
+    include /etc/nginx/snippets/security-headers.conf;
+
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass http://127.0.0.1:${APP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_read_timeout 60s;
+    }
+}
+NGINX
+  fi
+
+  # Enable
+  sudo ln -sf "$conf_path" "$NGINX_ENABLED/$APP_NAME"
+
+  # Test + reload
+  if sudo nginx -t >/dev/null 2>&1; then
+    sudo systemctl reload nginx
+    success "nginx configured and reloaded"
+  else
+    error "nginx config test failed. Config at ${conf_path}"
+    sudo nginx -t
+    exit 1
+  fi
+}
+
+get_ssl_certificate() {
+  if [[ "$USE_SSL" != "y" ]]; then return; fi
+
+  step "▸" "SSL certificate"
+
+  if ! has_cmd certbot; then
+    warn "certbot not installed — skipping SSL. Run ./server-setup to add it."
+    return
+  fi
+
+  info "Requesting Let's Encrypt cert for ${APP_DOMAIN} ..."
+  if sudo certbot --nginx \
+    --non-interactive --agree-tos \
+    --email "$SSL_EMAIL" \
+    --domain "$APP_DOMAIN" \
+    --redirect; then
+    success "SSL certificate installed"
+  else
+    warn "certbot failed — your app is still running on HTTP. Re-run after fixing DNS."
+  fi
+}
+
+start_pm2_process() {
+  if [[ "$IS_STATIC" == "y" ]]; then
+    info "Static site — nginx serves files directly, no pm2 process needed."
+    return
+  fi
+
+  if [[ "$APP_TYPE" == "docker" ]]; then
+    step "▸" "Docker"
+    info "Starting docker compose ..."
+    as_app_user "cd '$APP_DIR' && docker compose up -d"
+    success "Docker containers started"
+    return
+  fi
+
+  step "▸" "PM2 process"
+
+  # Stop existing if present
+  if as_app_user "pm2 list 2>/dev/null | grep -q \" $APP_NAME \""; then
+    info "Reloading existing pm2 process ..."
+    as_app_user "pm2 reload $APP_NAME --update-env"
+  else
+    info "Starting pm2 process: ${APP_NAME}"
+    # Use --cwd + raw command for maximum compatibility
+    as_app_user "cd '$APP_DIR' && pm2 start '$START_CMD' --name '$APP_NAME' --cwd '$APP_DIR'"
+  fi
+
+  # Save process list for boot persistence
+  as_app_user "pm2 save" >/dev/null 2>&1
+  success "pm2 process '${APP_NAME}' running"
+}
+
+save_deploy_state() {
+  local state_file="$APP_DIR/.deploy-state"
+  sudo -u "$APP_USER" tee "$state_file" >/dev/null <<EOF
+# Auto-generated by deploy-app. Do not edit.
+APP_NAME="${APP_NAME}"
+APP_TYPE="${APP_TYPE}"
+APP_SUBFRAMEWORK="${APP_SUBFRAMEWORK}"
+APP_PM="${APP_PM}"
+APP_PORT="${APP_PORT}"
+APP_DOMAIN="${APP_DOMAIN}"
+INSTALL_CMD="${INSTALL_CMD}"
+BUILD_CMD="${BUILD_CMD}"
+START_CMD="${START_CMD}"
+IS_STATIC="${IS_STATIC}"
+STATIC_DIR="${STATIC_DIR}"
+DEPLOYED_AT="$(date -Iseconds)"
+EOF
+}
+
+# ---------------------------
+# Summary
+# ---------------------------
+show_summary() {
+  echo
+  divider
+  echo
+  echo -e "  ${GREEN}${BOLD}✔ '${APP_NAME}' deployed!${RESET}"
+  echo
+
+  local proto="http"
+  [[ "$USE_SSL" == "y" ]] && proto="https"
+
+  echo -e "  ${DIM}URL ............${RESET} ${CYAN}${proto}://${APP_DOMAIN}${RESET}"
+  echo -e "  ${DIM}Path ...........${RESET} ${APP_DIR}"
+  echo -e "  ${DIM}nginx config ...${RESET} ${NGINX_AVAILABLE}/${APP_NAME}"
+  [[ "$IS_STATIC" != "y" && "$APP_TYPE" != "docker" ]] && \
+    echo -e "  ${DIM}pm2 process ....${RESET} ${APP_NAME}"
+  [[ "$USE_DB" == "y" ]] && \
+    echo -e "  ${DIM}Database .......${RESET} ${DB_NAME_VAL} (user: ${DB_USER_VAL})"
+
+  echo
+  echo -e "  ${YELLOW}${BOLD}Useful commands:${RESET}"
+  echo -e "    ${DIM}Redeploy:${RESET} ${CYAN}$0 --redeploy ${APP_NAME}${RESET}"
+  if [[ "$IS_STATIC" != "y" && "$APP_TYPE" != "docker" ]]; then
+    echo -e "    ${DIM}Logs:    ${RESET} ${CYAN}$0 --logs ${APP_NAME}${RESET}"
+    echo -e "    ${DIM}Restart: ${RESET} ${CYAN}$0 --restart ${APP_NAME}${RESET}"
+  fi
+  echo -e "    ${DIM}Remove:  ${RESET} ${CYAN}$0 --remove ${APP_NAME}${RESET}"
+  echo -e "    ${DIM}List all:${RESET} ${CYAN}$0 --list${RESET}"
+  echo
+}
+
+# ---------------------------
+# Parse flags
+# ---------------------------
+CMD=""
+CMD_ARG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --redeploy)     CMD="redeploy"; CMD_ARG="$2"; shift 2 ;;
+    --list)         CMD="list"; shift ;;
+    --logs)         CMD="logs"; CMD_ARG="$2"; shift 2 ;;
+    --remove)       CMD="remove"; CMD_ARG="$2"; shift 2 ;;
+    --restart)      CMD="restart"; CMD_ARG="$2"; shift 2 ;;
+    --name)         APP_NAME="$2"; shift 2 ;;
+    --repo)         APP_REPO="$2"; shift 2 ;;
+    --path)         APP_PATH="$2"; shift 2 ;;
+    --branch)       APP_BRANCH="$2"; shift 2 ;;
+    --domain)       APP_DOMAIN="$2"; shift 2 ;;
+    --port)         APP_PORT="$2"; shift 2 ;;
+    --type)         APP_TYPE="$2"; shift 2 ;;
+    --no-ssl)       USE_SSL="n"; shift ;;
+    --no-db)        USE_DB="skip"; shift ;;
+    --help|-h)      show_help ;;
+    *)              error "Unknown option: $1"; echo; show_help ;;
+  esac
+done
+
+# ---------------------------
+# Dispatch
+# ---------------------------
+case "$CMD" in
+  list)      cmd_list ;;
+  logs)      cmd_logs "$CMD_ARG" ;;
+  restart)   cmd_restart "$CMD_ARG" ;;
+  remove)    cmd_remove "$CMD_ARG" ;;
+  redeploy)
+    check_server_readiness
+    cmd_redeploy "$CMD_ARG"
+    ;;
+esac
+
+# ---------------------------
+# Main wizard
+# ---------------------------
+echo
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}App Deployment Wizard${RESET}                       ${BOLD}${CYAN}║${RESET}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+check_server_readiness
+collect_app_info
+clone_or_copy
+detect_and_configure
+collect_domain_ssl
+collect_database
+collect_env
+show_plan
+
+# Execute
+step "8" "Deploying"
+divider
+create_database_if_needed
+write_env_file
+run_install_build
+write_nginx_config
+start_pm2_process
+get_ssl_certificate
+save_deploy_state
+
+show_summary

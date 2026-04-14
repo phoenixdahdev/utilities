@@ -108,6 +108,54 @@ Interactive PostgreSQL database and user provisioner.
 
 ---
 
+### `deploy-app`
+
+End-to-end app deployment wizard. Ties everything together: git clone → install → build → `.env` → database → nginx site → SSL → pm2.
+
+```bash
+# Deploy a new app (interactive)
+./deploy-app
+
+# Partial flags
+./deploy-app --name myapp --repo git@github.com:me/myapp.git --domain myapp.com
+
+# Manage deployed apps
+./deploy-app --list                         # all deployed apps with status
+./deploy-app --redeploy myapp               # git pull + install + build + reload
+./deploy-app --logs myapp                   # tail pm2 logs
+./deploy-app --restart myapp                # pm2 restart
+./deploy-app --remove myapp                 # tear down (nginx + pm2 + files)
+```
+
+**Auto-detection:**
+- Framework from repo files: Node.js (`package.json`), Python (`requirements.txt`/`pyproject.toml`), Docker (`Dockerfile`), Static (`index.html`)
+- Node sub-framework: Next.js, Vite, Astro, SvelteKit, Nuxt, Express, Fastify, NestJS
+- Package manager: pnpm, yarn, bun, npm (from lockfile)
+- Suggests install / build / start commands per framework
+- DNS check: verifies the domain points at this server before requesting SSL
+
+**Commands:**
+
+| Command | What it does |
+|---|---|
+| *(default)* | Full wizard: source → framework → domain → SSL → DB → .env → deploy |
+| `--list` | All deployed apps with nginx/pm2 status and domain |
+| `--redeploy NAME` | Quick redeploy: git pull, re-run install/build from saved state, pm2 reload |
+| `--logs NAME` | Tail pm2 logs for an app |
+| `--restart NAME` | `pm2 restart` an app |
+| `--remove NAME` | Remove nginx config, pm2 process, and `/var/www/<name>` (double confirm) |
+
+**What it writes:**
+- `/var/www/<name>/` — source code
+- `/var/www/<name>/.env` — env vars (chmod 600, with auto-appended `DATABASE_URL` and `PORT`)
+- `/var/www/<name>/.deploy-state` — saved config for `--redeploy`
+- `/etc/nginx/sites-available/<name>` — site config (reverse proxy or static files)
+- `/etc/nginx/sites-enabled/<name>` — symlink
+- Let's Encrypt cert for the domain (via `certbot --nginx`)
+- pm2 process + `pm2 save` for boot persistence
+
+---
+
 ## Typical workflow
 
 **New dev machine:**
@@ -120,9 +168,11 @@ Interactive PostgreSQL database and user provisioner.
 # 1. Provision the server
 ./server-setup
 
-# 2. SSH in as deploy user, create a database
-./create-pg-database
+# 2. Deploy an app end-to-end (creates DB, nginx, SSL, pm2)
+./deploy-app
+```
 
-# 3. Get SSL
-sudo certbot --nginx -d yourdomain.com
+**Deploying subsequent updates:**
+```bash
+./deploy-app --redeploy myapp
 ```
