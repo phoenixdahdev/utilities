@@ -247,21 +247,21 @@ show_plan() {
   echo -e "  ${BOLD}Will install:${RESET}"
 
   local count=0
-  [[ "$INSTALL_ESSENTIALS" == "y" ]] && { echo -e "    ${GREEN}•${RESET} System essentials (git, curl, wget, build-essential)"; ((count++)); }
-  [[ "$INSTALL_ZSH" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} Zsh"; ((count++)); }
-  [[ "$INSTALL_OHMYZSH" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Oh My Zsh + zsh-syntax-highlighting + zsh-autosuggestions"; ((count++)); }
-  [[ "$INSTALL_ZSHRC" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} .zshrc (bundled config)"; ((count++)); }
-  [[ "$INSTALL_GHOSTTY" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Ghostty terminal (snap)"; ((count++)); }
-  [[ "$INSTALL_NVM" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} NVM + Node.js LTS"; ((count++)); }
-  [[ "$INSTALL_PNPM" == "y" ]]       && { echo -e "    ${GREEN}•${RESET} pnpm"; ((count++)); }
-  [[ "$INSTALL_BUN" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} Bun"; ((count++)); }
-  [[ "$INSTALL_PYTHON" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Python3 + pip + venv"; ((count++)); }
-  [[ "$INSTALL_POSTGRES" == "y" ]]   && { echo -e "    ${GREEN}•${RESET} PostgreSQL (PGDG)"; ((count++)); }
-  [[ "$INSTALL_NGINX" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} nginx"; ((count++)); }
-  [[ "$INSTALL_CERTBOT" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} certbot + python3-certbot-nginx"; ((count++)); }
-  [[ "$INSTALL_DOCKER" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Docker Engine"; ((count++)); }
-  [[ "$INSTALL_REDIS" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} Redis"; ((count++)); }
-  [[ "$INSTALL_UFW" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} UFW (allow SSH, HTTP, HTTPS)"; ((count++)); }
+  [[ "$INSTALL_ESSENTIALS" == "y" ]] && { echo -e "    ${GREEN}•${RESET} System essentials (git, curl, wget, build-essential)"; count=$((count + 1)); }
+  [[ "$INSTALL_ZSH" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} Zsh"; count=$((count + 1)); }
+  [[ "$INSTALL_OHMYZSH" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Oh My Zsh + zsh-syntax-highlighting + zsh-autosuggestions"; count=$((count + 1)); }
+  [[ "$INSTALL_ZSHRC" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} .zshrc (bundled config)"; count=$((count + 1)); }
+  [[ "$INSTALL_GHOSTTY" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Ghostty terminal (snap)"; count=$((count + 1)); }
+  [[ "$INSTALL_NVM" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} NVM + Node.js LTS"; count=$((count + 1)); }
+  [[ "$INSTALL_PNPM" == "y" ]]       && { echo -e "    ${GREEN}•${RESET} pnpm"; count=$((count + 1)); }
+  [[ "$INSTALL_BUN" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} Bun"; count=$((count + 1)); }
+  [[ "$INSTALL_PYTHON" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Python3 + pip + venv"; count=$((count + 1)); }
+  [[ "$INSTALL_POSTGRES" == "y" ]]   && { echo -e "    ${GREEN}•${RESET} PostgreSQL (PGDG)"; count=$((count + 1)); }
+  [[ "$INSTALL_NGINX" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} nginx"; count=$((count + 1)); }
+  [[ "$INSTALL_CERTBOT" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} certbot + python3-certbot-nginx"; count=$((count + 1)); }
+  [[ "$INSTALL_DOCKER" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Docker Engine"; count=$((count + 1)); }
+  [[ "$INSTALL_REDIS" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} Redis"; count=$((count + 1)); }
+  [[ "$INSTALL_UFW" == "y" ]]        && { echo -e "    ${GREEN}•${RESET} UFW (allow SSH, HTTP, HTTPS)"; count=$((count + 1)); }
 
   if [[ "$count" -eq 0 ]]; then
     warn "Nothing selected."

@@ -248,17 +248,17 @@ show_plan() {
   echo -e "  ${BOLD}Will configure:${RESET}"
 
   local count=0
-  [[ "$DO_SYSTEM" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} System update, essentials, timezone, locale"; ((count++)); }
-  [[ "$DO_SECURITY" == "y" ]]  && { echo -e "    ${GREEN}•${RESET} Security: user '${DEPLOY_USER}', SSH hardening, UFW, fail2ban, unattended-upgrades"; ((count++)); }
-  [[ "$DO_SWAP" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} Swap file (1GB or match RAM, whichever is smaller)"; ((count++)); }
-  [[ "$DO_NODE" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} NVM + Node.js LTS + PM2"; ((count++)); }
-  [[ "$DO_PYTHON" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Python3 + pip + venv"; ((count++)); }
-  [[ "$DO_POSTGRES" == "y" ]]  && { echo -e "    ${GREEN}•${RESET} PostgreSQL (PGDG)"; ((count++)); }
-  [[ "$DO_NGINX" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} nginx (hardened headers)"; ((count++)); }
-  [[ "$DO_CERTBOT" == "y" ]]   && { echo -e "    ${GREEN}•${RESET} Certbot + auto-renewal timer"; ((count++)); }
-  [[ "$DO_REDIS" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Redis (localhost only)"; ((count++)); }
-  [[ "$DO_DOCKER" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Docker Engine + Compose"; ((count++)); }
-  [[ "$DO_LOGROTATE" == "y" ]] && { echo -e "    ${GREEN}•${RESET} Logrotate for /var/log/apps/"; ((count++)); }
+  [[ "$DO_SYSTEM" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} System update, essentials, timezone, locale"; count=$((count + 1)); }
+  [[ "$DO_SECURITY" == "y" ]]  && { echo -e "    ${GREEN}•${RESET} Security: user '${DEPLOY_USER}', SSH hardening, UFW, fail2ban, unattended-upgrades"; count=$((count + 1)); }
+  [[ "$DO_SWAP" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} Swap file (1GB or match RAM, whichever is smaller)"; count=$((count + 1)); }
+  [[ "$DO_NODE" == "y" ]]      && { echo -e "    ${GREEN}•${RESET} NVM + Node.js LTS + PM2"; count=$((count + 1)); }
+  [[ "$DO_PYTHON" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Python3 + pip + venv"; count=$((count + 1)); }
+  [[ "$DO_POSTGRES" == "y" ]]  && { echo -e "    ${GREEN}•${RESET} PostgreSQL (PGDG)"; count=$((count + 1)); }
+  [[ "$DO_NGINX" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} nginx (hardened headers)"; count=$((count + 1)); }
+  [[ "$DO_CERTBOT" == "y" ]]   && { echo -e "    ${GREEN}•${RESET} Certbot + auto-renewal timer"; count=$((count + 1)); }
+  [[ "$DO_REDIS" == "y" ]]     && { echo -e "    ${GREEN}•${RESET} Redis (localhost only)"; count=$((count + 1)); }
+  [[ "$DO_DOCKER" == "y" ]]    && { echo -e "    ${GREEN}•${RESET} Docker Engine + Compose"; count=$((count + 1)); }
+  [[ "$DO_LOGROTATE" == "y" ]] && { echo -e "    ${GREEN}•${RESET} Logrotate for /var/log/apps/"; count=$((count + 1)); }
 
   if [[ "$count" -eq 0 ]]; then
     warn "Nothing selected."
