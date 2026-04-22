@@ -74,6 +74,7 @@ Interactive PostgreSQL database and user provisioner.
 # Manage users
 ./create-pg-database --change-password                            # change a user's password
 ./create-pg-database --change-password --user myuser              # change specific user
+./create-pg-database --grant-createdb --user myuser               # grant CREATEDB (Prisma shadow DB)
 ./create-pg-database --drop-user --user olduser                   # drop a role
 
 # Manage databases
@@ -95,6 +96,7 @@ Interactive PostgreSQL database and user provisioner.
 | `--db-info` | Deep inspect: tables with sizes + row estimates, indexes, extensions, connected roles |
 | `--connection-test` | Verify user can connect — checks server, auth, SELECT, schema access, TEMP tables |
 | `--change-password` | Interactive password change with confirmation |
+| `--grant-createdb` | Grant CREATEDB role privilege (required by Prisma's shadow database). Auto-granted when ORM=prisma in the wizard. |
 | `--drop-database` | Drop database with size/table warning + double confirmation (type name to confirm) |
 | `--drop-user` | Drop role, auto-reassigns owned objects, prevents dropping `postgres` |
 | `--backup` | `pg_dump` wrapper — custom/plain/directory formats, auto-named output files |
@@ -102,6 +104,7 @@ Interactive PostgreSQL database and user provisioner.
 
 **Features:**
 - ORM-aware permissions: `prisma`, `typeorm`, `sequelize`, `django`, `generic`
+- When ORM is `prisma`, also grants `CREATEDB` to the user so `prisma migrate dev` can create its shadow database
 - `--owner` mode for full database ownership
 - `--existing-user` to skip role creation
 - Prints ready-to-paste connection strings (Prisma `.env`, Django `settings.py`, TypeORM, Sequelize)

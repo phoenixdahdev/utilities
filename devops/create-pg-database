@@ -107,6 +107,7 @@ Commands:
   --list-users             List all PostgreSQL roles with details
   --list-databases         List all databases with size, owner, tables
   --change-password        Change password for an existing user
+  --grant-createdb         Grant CREATEDB to a role (for Prisma shadow DB)
   --drop-database          Drop a database (interactive confirmation)
   --drop-user              Drop a role (interactive confirmation)
   --backup                 Backup a database (pg_dump)
@@ -132,6 +133,7 @@ Examples:
   $0 --list-databases                             # show all databases
   $0 --change-password                            # interactive password change
   $0 --change-password --user myuser              # change specific user
+  $0 --grant-createdb --user myuser               # grant CREATEDB (Prisma)
   $0 --drop-database --db-name oldapp             # drop a database
   $0 --drop-user --user olduser                   # drop a role
   $0 --backup --db-name myapp                     # backup to ./myapp_<date>.dump
@@ -341,6 +343,80 @@ cmd_change_password() {
   local port
   port=$(pg_port 2>/dev/null || echo "5432")
   echo -e "  ${DIM}Test with:${RESET} ${CYAN}psql -h localhost -p ${port} -U ${target_user} -d postgres${RESET}"
+  echo
+
+  exit 0
+}
+
+# ---------------------------
+# Command: grant createdb
+# ---------------------------
+cmd_grant_createdb() {
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${RESET}   ${BOLD}Grant CREATEDB Privilege${RESET}                    ${BOLD}${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+
+  if ! pg_is_installed; then
+    error "PostgreSQL client (psql) is not installed."
+    exit 1
+  fi
+  if ! pg_is_running; then
+    error "PostgreSQL server is not running."
+    exit 1
+  fi
+
+  # Show roles
+  echo
+  echo -e "  ${UNDERLINE}Existing roles (CREATEDB shown):${RESET}"
+  local roles_out
+  roles_out=$(sudo -u postgres psql -tA -F ' | ' -c \
+    "SELECT rolname, CASE WHEN rolcreatedb THEN 'yes' ELSE 'no' END \
+     FROM pg_roles WHERE rolname NOT LIKE 'pg_%' ORDER BY rolname;" 2>/dev/null)
+  while IFS='|' read -r rname rcdb; do
+    rname=$(echo "$rname" | xargs); rcdb=$(echo "$rcdb" | xargs)
+    [[ -z "$rname" ]] && continue
+    if [[ "$rcdb" == "yes" ]]; then
+      echo -e "    ${GREEN}✔${RESET} ${rname} ${DIM}(CREATEDB)${RESET}"
+    else
+      echo -e "    ${DIM}•${RESET} ${rname}"
+    fi
+  done <<< "$roles_out"
+  echo
+
+  # Pick user
+  local target_user="$DB_USER"
+  if [[ -z "$target_user" ]]; then
+    ask "Which role to grant CREATEDB to" target_user
+  else
+    info "User: ${WHITE}${target_user}${RESET} (from flag)"
+  fi
+
+  if ! pg_role_exists "$target_user"; then
+    error "Role '${target_user}' does not exist."
+    exit 1
+  fi
+
+  # Check current state
+  local already
+  already=$(sudo -u postgres psql -tAc \
+    "SELECT rolcreatedb FROM pg_roles WHERE rolname='${target_user}';" 2>/dev/null | xargs)
+  if [[ "$already" == "t" ]]; then
+    success "Role '${target_user}' already has CREATEDB. Nothing to do."
+    exit 0
+  fi
+
+  echo
+  echo -e "  ${BOLD}Will grant:${RESET} ${WHITE}CREATEDB${RESET} to ${WHITE}${target_user}${RESET}"
+  echo -e "  ${DIM}Required by Prisma's shadow database feature.${RESET}"
+  confirm_or_abort
+
+  echo -en "  Granting CREATEDB to '${target_user}' ... "
+  sudo -u postgres psql -q -c "ALTER ROLE \"${target_user}\" CREATEDB;"
+  echo -e "${GREEN}done${RESET}"
+
+  echo
+  success "Granted. '${target_user}' can now create databases."
   echo
 
   exit 0
@@ -1344,6 +1420,11 @@ show_plan() {
       echo -e "    ${DIM}├ Default CRUD privileges on future tables${RESET}"
       echo -e "    ${DIM}└ Default sequence privileges on future sequences${RESET}"
     fi
+
+    if [[ "$ORM" == "prisma" ]]; then
+      ((action_num++))
+      echo -e "  ${GREEN}${action_num}.${RESET} Grant ${WHITE}CREATEDB${RESET} to ${WHITE}${DB_USER}${RESET} ${DIM}(for Prisma shadow DB)${RESET}"
+    fi
   fi
 
   echo
@@ -1442,6 +1523,13 @@ EOF
         ;;
     esac
     echo -e "${GREEN}done${RESET}"
+
+    # Prisma's shadow database needs the CREATEDB role privilege
+    if [[ "$ORM" == "prisma" ]]; then
+      echo -en "  Granting CREATEDB (for Prisma shadow DB) ... "
+      sudo -u postgres psql -q -c "ALTER ROLE \"${DB_USER}\" CREATEDB;"
+      echo -e "${GREEN}done${RESET}"
+    fi
   fi
 }
 
@@ -1516,6 +1604,7 @@ DB_ALREADY_EXISTS="n"
 ROLE_ALREADY_EXISTS="n"
 CMD_LIST_USERS="n"
 CMD_CHANGE_PASS="n"
+CMD_GRANT_CREATEDB="n"
 CMD_LIST_DBS="n"
 CMD_DROP_DB="n"
 CMD_DROP_USER="n"
@@ -1537,6 +1626,8 @@ while [[ $# -gt 0 ]]; do
       CMD_LIST_DBS="y"; shift ;;
     --change-password)
       CMD_CHANGE_PASS="y"; shift ;;
+    --grant-createdb)
+      CMD_GRANT_CREATEDB="y"; shift ;;
     --drop-database)
       CMD_DROP_DB="y"; shift ;;
     --drop-user)
@@ -1579,10 +1670,11 @@ done
 # ---------------------------
 # Dispatch commands
 # ---------------------------
-[[ "$CMD_LIST_USERS" == "y" ]]  && cmd_list_users
-[[ "$CMD_LIST_DBS" == "y" ]]    && cmd_list_databases
-[[ "$CMD_CHANGE_PASS" == "y" ]] && cmd_change_password
-[[ "$CMD_DROP_DB" == "y" ]]     && cmd_drop_database
+[[ "$CMD_LIST_USERS" == "y" ]]     && cmd_list_users
+[[ "$CMD_LIST_DBS" == "y" ]]       && cmd_list_databases
+[[ "$CMD_CHANGE_PASS" == "y" ]]    && cmd_change_password
+[[ "$CMD_GRANT_CREATEDB" == "y" ]] && cmd_grant_createdb
+[[ "$CMD_DROP_DB" == "y" ]]        && cmd_drop_database
 [[ "$CMD_DROP_USER" == "y" ]]   && cmd_drop_user
 [[ "$CMD_BACKUP" == "y" ]]      && cmd_backup
 [[ "$CMD_RESTORE" == "y" ]]     && cmd_restore
